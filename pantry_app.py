@@ -3,7 +3,17 @@ from flask import Flask, request, redirect, url_for, render_template_string, abo
 import sqlite3
 
 APP = Flask(__name__)
-DB = "/tmp/church_pantry.db"
+DB = os.environ.get("PANTRY_DB_PATH", "/tmp/church_pantry.db")
+
+_DB_READY = False
+
+def ensure_db():
+    global _DB_READY
+    if _DB_READY:
+        return
+    # Create tables + seed data if needed
+    init_db()
+    _DB_READY = True
 
 import base64
 from functools import wraps
@@ -32,6 +42,7 @@ def manager_protect(fn):
 
 
 def conn():
+    ensure_db()
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys = ON;")
