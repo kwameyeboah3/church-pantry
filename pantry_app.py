@@ -1,8 +1,15 @@
 import os
 from flask import Flask, request, redirect, url_for, render_template_string, abort
+from werkzeug.utils import secure_filename
+import uuid
+import re
 import sqlite3
 
 APP = Flask(__name__)
+UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'static', 'items')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+ALLOWED_EXTS = {'.png','.jpg','.jpeg','.webp','.gif'}
+
 DB = os.environ.get("PANTRY_DB_PATH", "/tmp/church_pantry.db")
 
 def raw_conn():
@@ -309,52 +316,181 @@ def member_request():
     return render_template_string(BASE, body=body)
 
 
-@APP.route("/manager/stock", methods=["GET", "POST"])
-@manager_protect
+
+@APP.route("/manager/stock", methods=["GET","POST"])
+@requires_manager_auth
 def manager_stock():
-    c = conn()
-    items = c.execute("SELECT item_id, item_name, unit FROM items WHERE is_active=1 ORDER BY item_name").fetchall()
+    """
+    Manager Intake:
+      - Add NEW item (name, unit, starting qty, optional image upload)
+      - Update EXISTING item stock (qty delta) and optionally update image
+    """
+    msg = ""
 
     if request.method == "POST":
-        item_id = int(request.form["item_id"])
-        qty = float(request.form["qty"])
-        note = request.form.get("note", "").strip()
-        created_by = request.form.get("created_by", "manager").strip() or "manager"
+        action = (request.form.get("action") or "").strip()
 
-        if qty <= 0:
-            return render_template_string(BASE, body="<p class='bad'>Quantity must be > 0.</p>")
+        if action == "add_new":
+            name = (request.form.get("new_name") or "").strip()
+            unit = (request.form.get("new_unit") or "unit").strip()
+            qty = float(request.form.get("new_qty") or 0)
 
-        c.execute("""
-        INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by)
-        VALUES (?, 'IN', ?, ?, ?)
-        """, (item_id, qty, note or "Stock intake", created_by))
-        c.commit()
-        c.close()
-        return redirect(url_for("report_stock"))
+            if not name:
+                msg = "Item name is required."
+            else:
+                img_url = ""
+                if "new_image" in request.files:
+                    img_url = save_item_image(request.files.get("new_image"), name)
 
-    options = "".join([f"<option value='{it['item_id']}'>{it['item_name']} ({it['unit']})</option>" for it in items])
-    body = f"""
-    <div class="card">
-      <h3>Manager: Add / Update Stock (Intake)</h3>
-      <form method="POST">
-        <label>Item</label>
-        <select name="item_id" required>{options}</select>
+                c = conn()
+                c.execute(
+                    "INSERT OR IGNORE INTO items(name, unit, qty_available, image_url) VALUES (?,?,?,?)",
+                    (name, unit, 0, img_url)
+                )
+                c.execute("UPDATE items SET qty_available = qty_available + ? WHERE name = ?", (qty, name))
+                if img_url:
+                    c.execute("UPDATE items SET image_url = ? WHERE name = ?", (img_url, name))
+                c.commit()
+                c.close()
+                msg = f"Added/updated item '{name}' with +{qty} stock."
 
-        <label>Quantity to ADD</label>
-        <input type="number" step="0.01" min="0.01" name="qty" required>
+        elif action == "update_existing":
+            item_id = int(request.form.get("item_id") or 0)
+            qty_delta = float(request.form.get("qty_delta") or 0)
 
-        <label>Note (optional)</label>
-        <input name="note" placeholder="Donation, Purchase, etc.">
+            c = conn()
+            it = c.execute("SELECT item_id, name FROM items WHERE item_id=?", (item_id,)).fetchone()
+            if not it:
+                msg = "Item not found."
+                c.close()
+            else:
+                name = it["name"]
+                img_url = ""
+                if "update_image" in request.files:
+                    img_url = save_item_image(request.files.get("update_image"), name)
 
-        <label>Manager name (optional)</label>
-        <input name="created_by" placeholder="manager">
+                c.execute("UPDATE items SET qty_available = qty_available + ? WHERE item_id=?", (qty_delta, item_id))
+                if img_url:
+                    c.execute("UPDATE items SET image_url = ? WHERE item_id=?", (img_url, item_id))
+                c.commit()
+                c.close()
+                msg = f"Updated '{name}' stock by {qty_delta}."
 
-        <button type="submit">Add Stock</button>
-      </form>
-    </div>
-    """
+    c = conn()
+    items = c.execute(
+        "SELECT item_id, name, unit, qty_available, COALESCE(image_url,'') AS image_url FROM items ORDER BY name"
+    ).fetchall()
     c.close()
-    return render_template_string(BASE, body=body)
+
+    return render_template_string("""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Manager: Add / Update Stock</title>
+  <style>
+    body{font-family:Arial, sans-serif; margin:24px; max-width:1100px;}
+    a{margin-right:10px;}
+    .card{border:1px solid #ddd; border-radius:10px; padding:16px; margin:14px 0;}
+    .grid{display:grid; grid-template-columns: 1fr 1fr; gap:18px;}
+    .muted{color:#666; font-size: 13px;}
+    input[type="text"], input[type="number"]{width:100%; padding:8px;}
+    select{width:100%; padding:8px;}
+    .btn{padding:10px 14px; border-radius:10px; border:1px solid #333; background:#fff; cursor:pointer;}
+    img{width:90px; height:90px; object-fit:contain; border:1px solid #eee; border-radius:10px; background:#fff;}
+    .row{display:flex; align-items:center; gap:12px;}
+    .msg{padding:10px; border-radius:10px; background:#f2f7ff; border:1px solid #cfe2ff; margin-bottom:10px;}
+  </style>
+</head>
+<body>
+  <h2>Church Food Pantry</h2>
+  <div>
+    <a href="/member/request">Member Request Form</a> |
+    <a href="/manager/stock">Manager: Add Stock</a> |
+    <a href="/manager/requests">Manager: Approvals</a> |
+    <a href="/reports/stock">Report: Stock</a>
+  </div>
+
+  <div class="card">
+    <h3>Manager: Add / Update Stock (Intake)</h3>
+    {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
+
+    <div class="grid">
+      <div class="card" style="margin:0;">
+        <h4>Add NEW item</h4>
+        <div class="muted">New items will appear in the Member Request Form automatically.</div>
+
+        <form method="post" enctype="multipart/form-data">
+          <input type="hidden" name="action" value="add_new"/>
+          <label><b>Item Name</b></label>
+          <input type="text" name="new_name" required/>
+
+          <div style="height:10px;"></div>
+          <label><b>Unit</b></label>
+          <input type="text" name="new_unit" value="unit"/>
+
+          <div style="height:10px;"></div>
+          <label><b>Starting Quantity (Intake)</b></label>
+          <input type="number" step="1" min="0" name="new_qty" value="0"/>
+
+          <div style="height:10px;"></div>
+          <label><b>Item Image (optional)</b></label>
+          <input type="file" name="new_image" accept="image/*"/>
+
+          <div style="height:14px;"></div>
+          <button class="btn" type="submit">Add Item</button>
+        </form>
+      </div>
+
+      <div class="card" style="margin:0;">
+        <h4>Update EXISTING item stock</h4>
+        <div class="muted">Use negative numbers to deduct stock.</div>
+
+        <form method="post" enctype="multipart/form-data">
+          <input type="hidden" name="action" value="update_existing"/>
+
+          <label><b>Select Item</b></label>
+          <select name="item_id" required>
+            {% for it in items %}
+              <option value="{{it['item_id']}}">{{it['name']}} (Available: {{'%.2f'|format(it['qty_available'])}})</option>
+            {% endfor %}
+          </select>
+
+          <div style="height:10px;"></div>
+          <label><b>Quantity Change</b></label>
+          <input type="number" step="1" name="qty_delta" value="0"/>
+
+          <div style="height:10px;"></div>
+          <label><b>Update Image (optional)</b></label>
+          <input type="file" name="update_image" accept="image/*"/>
+
+          <div style="height:14px;"></div>
+          <button class="btn" type="submit">Apply Update</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Current Items (Members will see these)</h3>
+    {% for it in items %}
+      <div class="row" style="margin:10px 0;">
+        {% if it['image_url'] %}
+          <img src="{{it['image_url']}}" alt="{{it['name']}}"/>
+        {% else %}
+          <img src="/static/items/placeholder.png" alt="No image"/>
+        {% endif %}
+        <div>
+          <b>{{it['name']}}</b><br/>
+          <span class="muted">Unit: {{it['unit']}} | Available: {{'%.2f'|format(it['qty_available'])}}</span>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+
+</body>
+</html>
+""", items=items, msg=msg)
 
 
 @APP.get("/manager/requests")
@@ -565,3 +701,21 @@ def report_stock():
 if __name__ == "__main__":
     init_db()
     APP.run(host="0.0.0.0", port=5000, debug=True)
+
+
+def save_item_image(file_storage, item_name: str) -> str:
+    """Save uploaded image to static/items and return /static/items/<file>"""
+    if not file_storage or not getattr(file_storage, "filename", ""):
+        return ""
+
+    filename = secure_filename(file_storage.filename)
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in ALLOWED_EXTS:
+        return ""
+
+    safe_item = re.sub(r'[^a-zA-Z0-9]+', '_', item_name.strip()).strip('_').lower()
+    out_name = f"{safe_item}_{uuid.uuid4().hex[:8]}{ext}"
+    out_path = os.path.join(UPLOAD_FOLDER, out_name)
+    file_storage.save(out_path)
+    return f"/static/items/{out_name}"
+
