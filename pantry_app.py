@@ -1,0 +1,540 @@
+import os
+from flask import Flask, request, redirect, url_for, render_template_string, abort
+import sqlite3
+
+APP = Flask(__name__)
+DB = "church_pantry.db"
+
+import base64
+from functools import wraps
+from flask import Response
+
+MANAGER_PASSWORD = os.environ.get("PANTRY_MANAGER_PASSWORD", "ChangeMe123!")
+
+def check_basic_auth(auth_header: str) -> bool:
+    if not auth_header or not auth_header.startswith("Basic "):
+        return False
+    try:
+        b64 = auth_header.split(" ", 1)[1].strip()
+        userpass = base64.b64decode(b64).decode("utf-8")
+        username, password = userpass.split(":", 1)
+        return (username == "manager") and (password == MANAGER_PASSWORD)
+    except Exception:
+        return False
+
+def manager_protect(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if check_basic_auth(request.headers.get("Authorization")):
+            return fn(*args, **kwargs)
+        return Response("Auth required", 401, {"WWW-Authenticate": 'Basic realm="Pantry Manager"'})
+    return wrapper
+
+
+def conn():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys = ON;")
+    return c
+
+
+def init_db():
+    c = conn()
+    c.executescript("""
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS members (
+      member_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+      member_code    TEXT UNIQUE,
+      first_name     TEXT NOT NULL,
+      last_name      TEXT NOT NULL,
+      phone          TEXT,
+      email          TEXT,
+      household_size INTEGER,
+      created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS items (
+      item_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+      sku         TEXT UNIQUE,
+      item_name   TEXT NOT NULL UNIQUE,
+      unit        TEXT NOT NULL DEFAULT 'each',
+      is_active   INTEGER NOT NULL DEFAULT 1,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS stock_movements (
+      movement_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+      item_id        INTEGER NOT NULL,
+      movement_type  TEXT NOT NULL CHECK (movement_type IN ('IN','OUT','ADJUST')),
+      qty            REAL NOT NULL CHECK (qty > 0),
+      note           TEXT,
+      ref_request_id INTEGER,
+      created_by     TEXT,
+      created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (item_id) REFERENCES items(item_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_stock_movements_item ON stock_movements(item_id);
+
+    CREATE TABLE IF NOT EXISTS requests (
+      request_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+      member_id     INTEGER NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'SUBMITTED'
+                   CHECK (status IN ('DRAFT','SUBMITTED','APPROVED','DENIED','CANCELLED','FULFILLED')),
+      requested_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      reviewed_at   TEXT,
+      reviewed_by   TEXT,
+      review_note   TEXT,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (member_id) REFERENCES members(member_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
+
+    CREATE TABLE IF NOT EXISTS request_items (
+      request_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id      INTEGER NOT NULL,
+      item_id         INTEGER NOT NULL,
+      qty_requested   REAL NOT NULL CHECK (qty_requested > 0),
+      qty_approved    REAL CHECK (qty_approved IS NULL OR qty_approved >= 0),
+      UNIQUE (request_id, item_id),
+      FOREIGN KEY (request_id) REFERENCES requests(request_id) ON DELETE CASCADE,
+      FOREIGN KEY (item_id) REFERENCES items(item_id)
+    );
+
+    CREATE VIEW IF NOT EXISTS v_stock_on_hand AS
+    SELECT
+      i.item_id,
+      i.item_name,
+      i.unit,
+      COALESCE(SUM(
+        CASE sm.movement_type
+          WHEN 'IN'  THEN sm.qty
+          WHEN 'OUT' THEN -sm.qty
+          WHEN 'ADJUST' THEN sm.qty
+        END
+      ), 0) AS stock_on_hand
+    FROM items i
+    LEFT JOIN stock_movements sm ON sm.item_id = i.item_id
+    WHERE i.is_active = 1
+    GROUP BY i.item_id, i.item_name, i.unit;
+    """)
+    c.commit()
+
+    # Seed minimal data if empty
+    if c.execute("SELECT COUNT(*) AS n FROM members").fetchone()["n"] == 0:
+        c.execute("""
+        INSERT INTO members (member_code, first_name, last_name, phone, email, household_size)
+        VALUES
+        ('CH-001', 'Kwame', 'Yeboah', '555-0101', 'kwame@example.com', 3),
+        ('CH-002', 'Ama', 'Mensah', '555-0102', 'ama@example.com', 5)
+        """)
+    if c.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"] == 0:
+        c.execute("""
+        INSERT INTO items (sku, item_name, unit) VALUES
+        ('RICE-5LB', 'Rice (5 lb bag)', 'bag'),
+        ('BEANS-1LB', 'Beans (1 lb)', 'bag'),
+        ('OIL-1L', 'Cooking Oil (1 L)', 'bottle'),
+        ('SOAP', 'Bath Soap', 'bar')
+        """)
+    if c.execute("SELECT COUNT(*) AS n FROM stock_movements").fetchone()["n"] == 0:
+        items = c.execute("SELECT item_id, item_name FROM items").fetchall()
+        starter = {
+            "Rice (5 lb bag)": 40,
+            "Beans (1 lb)": 80,
+            "Cooking Oil (1 L)": 30,
+            "Bath Soap": 120,
+        }
+        for it in items:
+            qty = starter.get(it["item_name"], 0)
+            if qty > 0:
+                c.execute("""
+                INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by)
+                VALUES (?, 'IN', ?, 'Initial stock', 'manager')
+                """, (it["item_id"], qty))
+    c.commit()
+    c.close()
+
+
+BASE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Church Pantry</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; max-width: 900px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #ddd; padding: 8px; }
+    th { background: #f3f3f3; text-align: left; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .card { border: 1px solid #ddd; padding: 14px; border-radius: 8px; flex: 1; min-width: 280px; }
+    input, select, textarea { width: 100%; padding: 8px; margin-top: 6px; }
+    button { padding: 10px 14px; margin-top: 10px; cursor: pointer; }
+    a { text-decoration: none; }
+    .muted { color: #666; }
+    .ok { color: #0a7; font-weight: bold; }
+    .bad { color: #c00; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h2>Church Food Pantry</h2>
+  <p class="muted">
+    <a href="{{ url_for('member_request') }}">Member Request Form</a> |
+    <a href="{{ url_for('manager_stock') }}">Manager: Add Stock</a> |
+    <a href="{{ url_for('manager_requests') }}">Manager: Approvals</a> |
+    <a href="{{ url_for('report_stock') }}">Report: Stock</a>
+  </p>
+  <hr/>
+  {{ body|safe }}
+</body>
+</html>
+"""
+
+
+@APP.get("/")
+def home():
+    return redirect(url_for("member_request"))
+
+
+def get_stock_map():
+    c = conn()
+    rows = c.execute("SELECT item_id, stock_on_hand FROM v_stock_on_hand").fetchall()
+    c.close()
+    return {r["item_id"]: float(r["stock_on_hand"]) for r in rows}
+
+
+@APP.route("/member/request", methods=["GET", "POST"])
+def member_request():
+    c = conn()
+    members = c.execute("SELECT member_id, member_code, first_name, last_name FROM members ORDER BY last_name").fetchall()
+    items = c.execute("SELECT item_id, item_name, unit FROM items WHERE is_active=1 ORDER BY item_name").fetchall()
+    stock = get_stock_map()
+
+    if request.method == "POST":
+        member_id = int(request.form["member_id"])
+        selections = []
+        for it in items:
+            key = f"qty_{it['item_id']}"
+            raw = request.form.get(key, "").strip()
+            if raw:
+                try:
+                    qty = float(raw)
+                except ValueError:
+                    continue
+                if qty > 0:
+                    selections.append((it["item_id"], qty))
+
+        if not selections:
+            body = "<p class='bad'>Please enter at least one item quantity.</p>"
+            return render_template_string(BASE, body=body)
+
+        cur = c.execute("INSERT INTO requests (member_id, status) VALUES (?, 'SUBMITTED')", (member_id,))
+        req_id = cur.lastrowid
+
+        for item_id, qty in selections:
+            c.execute("""
+            INSERT INTO request_items (request_id, item_id, qty_requested)
+            VALUES (?, ?, ?)
+            """, (req_id, item_id, qty))
+
+        c.commit()
+        c.close()
+
+        body = f"""
+        <p class='ok'>Request submitted successfully.</p>
+        <p>Request ID: <b>{req_id}</b></p>
+        <p><a href="{url_for('member_request')}">Submit another request</a></p>
+        """
+        return render_template_string(BASE, body=body)
+
+    options = "".join([f"<option value='{m['member_id']}'>{m['member_code']} - {m['first_name']} {m['last_name']}</option>" for m in members])
+    rows = ""
+    for it in items:
+        available = stock.get(it["item_id"], 0.0)
+        rows += f"""
+        <tr>
+          <td>{it['item_name']}</td>
+          <td>{it['unit']}</td>
+          <td>{available:.2f}</td>
+          <td><input type="number" step="0.01" min="0" name="qty_{it['item_id']}" placeholder="0"></td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="card">
+      <h3>Member Request Form</h3>
+      <form method="POST">
+        <label>Member</label>
+        <select name="member_id" required>{options}</select>
+        <h4>Items</h4>
+        <table>
+          <thead><tr><th>Item</th><th>Unit</th><th>Available</th><th>Qty Requested</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+        <button type="submit">Submit Request</button>
+      </form>
+    </div>
+    """
+    c.close()
+    return render_template_string(BASE, body=body)
+
+
+@APP.route("/manager/stock", methods=["GET", "POST"])
+@manager_protect
+def manager_stock():
+    c = conn()
+    items = c.execute("SELECT item_id, item_name, unit FROM items WHERE is_active=1 ORDER BY item_name").fetchall()
+
+    if request.method == "POST":
+        item_id = int(request.form["item_id"])
+        qty = float(request.form["qty"])
+        note = request.form.get("note", "").strip()
+        created_by = request.form.get("created_by", "manager").strip() or "manager"
+
+        if qty <= 0:
+            return render_template_string(BASE, body="<p class='bad'>Quantity must be > 0.</p>")
+
+        c.execute("""
+        INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by)
+        VALUES (?, 'IN', ?, ?, ?)
+        """, (item_id, qty, note or "Stock intake", created_by))
+        c.commit()
+        c.close()
+        return redirect(url_for("report_stock"))
+
+    options = "".join([f"<option value='{it['item_id']}'>{it['item_name']} ({it['unit']})</option>" for it in items])
+    body = f"""
+    <div class="card">
+      <h3>Manager: Add / Update Stock (Intake)</h3>
+      <form method="POST">
+        <label>Item</label>
+        <select name="item_id" required>{options}</select>
+
+        <label>Quantity to ADD</label>
+        <input type="number" step="0.01" min="0.01" name="qty" required>
+
+        <label>Note (optional)</label>
+        <input name="note" placeholder="Donation, Purchase, etc.">
+
+        <label>Manager name (optional)</label>
+        <input name="created_by" placeholder="manager">
+
+        <button type="submit">Add Stock</button>
+      </form>
+    </div>
+    """
+    c.close()
+    return render_template_string(BASE, body=body)
+
+
+@APP.get("/manager/requests")
+@manager_protect
+def manager_requests():
+    c = conn()
+    reqs = c.execute("""
+      SELECT r.request_id, r.status, r.requested_at,
+             m.member_code, m.first_name, m.last_name
+      FROM requests r
+      JOIN members m ON m.member_id = r.member_id
+      WHERE r.status IN ('SUBMITTED')
+      ORDER BY r.request_id DESC
+    """).fetchall()
+
+    rows = ""
+    for r in reqs:
+        rows += f"""
+        <tr>
+          <td>{r['request_id']}</td>
+          <td>{r['member_code']} - {r['first_name']} {r['last_name']}</td>
+          <td>{r['requested_at']}</td>
+          <td>{r['status']}</td>
+          <td><a href="{url_for('manager_request_detail', request_id=r['request_id'])}">Review</a></td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="card">
+      <h3>Manager: Pending Requests</h3>
+      <table>
+        <thead><tr><th>ID</th><th>Member</th><th>Requested at</th><th>Status</th><th>Action</th></tr></thead>
+        <tbody>{rows or "<tr><td colspan='5' class='muted'>No pending requests.</td></tr>"}</tbody>
+      </table>
+    </div>
+    """
+    c.close()
+    return render_template_string(BASE, body=body)
+
+
+@APP.route("/manager/requests/<int:request_id>", methods=["GET", "POST"])
+@manager_protect
+def manager_request_detail(request_id: int):
+    c = conn()
+
+    req = c.execute("""
+      SELECT r.request_id, r.status, r.requested_at,
+             m.member_code, m.first_name, m.last_name
+      FROM requests r
+      JOIN members m ON m.member_id = r.member_id
+      WHERE r.request_id = ?
+    """, (request_id,)).fetchone()
+
+    if not req:
+        c.close()
+        abort(404)
+
+    items = c.execute("""
+      SELECT ri.request_item_id, ri.item_id, ri.qty_requested, ri.qty_approved,
+             i.item_name, i.unit,
+             (SELECT stock_on_hand FROM v_stock_on_hand WHERE item_id = ri.item_id) AS stock_on_hand
+      FROM request_items ri
+      JOIN items i ON i.item_id = ri.item_id
+      WHERE ri.request_id = ?
+      ORDER BY i.item_name
+    """, (request_id,)).fetchall()
+
+    if request.method == "POST":
+        action = request.form["action"]
+        reviewed_by = request.form.get("reviewed_by", "manager").strip() or "manager"
+        note = request.form.get("review_note", "").strip()
+
+        # update approved quantities from form fields
+        for it in items:
+            key = f"approve_{it['request_item_id']}"
+            raw = request.form.get(key, "").strip()
+            if raw:
+                qty_appr = float(raw)
+                if qty_appr < 0:
+                    qty_appr = 0
+                c.execute("UPDATE request_items SET qty_approved=? WHERE request_item_id=?",
+                          (qty_appr, it["request_item_id"]))
+
+        if action == "DENY":
+            c.execute("""
+              UPDATE requests
+              SET status='DENIED', reviewed_by=?, reviewed_at=datetime('now'), review_note=?
+              WHERE request_id=? AND status='SUBMITTED'
+            """, (reviewed_by, note, request_id))
+            c.commit()
+            c.close()
+            return redirect(url_for("manager_requests"))
+
+        if action == "APPROVE":
+            # Check stock before approving
+            check_rows = c.execute("""
+              SELECT
+                i.item_name,
+                COALESCE(ri.qty_approved, ri.qty_requested) AS need,
+                (SELECT stock_on_hand FROM v_stock_on_hand WHERE item_id = ri.item_id) AS have
+              FROM request_items ri
+              JOIN items i ON i.item_id = ri.item_id
+              WHERE ri.request_id = ?
+            """, (request_id,)).fetchall()
+
+            for r in check_rows:
+                have = float(r["have"] or 0)
+                need = float(r["need"] or 0)
+                if need > have:
+                    c.close()
+                    return render_template_string(
+                        BASE,
+                        body=f"<p class='bad'>Not enough stock for <b>{r['item_name']}</b>. Need {need}, have {have}.</p>"
+                             f"<p><a href='{url_for('manager_request_detail', request_id=request_id)}'>Go back</a></p>"
+                    )
+
+            # Approve request
+            c.execute("""
+              UPDATE requests
+              SET status='APPROVED', reviewed_by=?, reviewed_at=datetime('now'), review_note=?
+              WHERE request_id=? AND status='SUBMITTED'
+            """, (reviewed_by, note, request_id))
+
+            # Deduct stock
+            c.execute("""
+              INSERT INTO stock_movements (item_id, movement_type, qty, note, ref_request_id, created_by)
+              SELECT item_id, 'OUT',
+                     COALESCE(qty_approved, qty_requested),
+                     'Approved request: stock deducted',
+                     request_id,
+                     ?
+              FROM request_items
+              WHERE request_id = ?
+            """, (reviewed_by, request_id))
+
+            c.commit()
+            c.close()
+            return redirect(url_for("manager_requests"))
+
+    rows = ""
+    for it in items:
+        have = float(it["stock_on_hand"] or 0)
+        req_qty = float(it["qty_requested"] or 0)
+        appr_default = req_qty if it["qty_approved"] is None else float(it["qty_approved"])
+
+        rows += f"""
+        <tr>
+          <td>{it['item_name']}</td>
+          <td>{it['unit']}</td>
+          <td>{have:.2f}</td>
+          <td>{req_qty:.2f}</td>
+          <td><input type="number" step="0.01" min="0" name="approve_{it['request_item_id']}" value="{appr_default:.2f}"></td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="card">
+      <h3>Request #{req['request_id']}</h3>
+      <p><b>Member:</b> {req['member_code']} - {req['first_name']} {req['last_name']}<br/>
+         <b>Status:</b> {req['status']}<br/>
+         <b>Requested at:</b> {req['requested_at']}</p>
+
+      <form method="POST">
+        <table>
+          <thead>
+            <tr><th>Item</th><th>Unit</th><th>Stock</th><th>Requested</th><th>Approve Qty</th></tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>
+
+        <div class="row" style="margin-top:12px;">
+          <div class="card">
+            <label>Reviewed by</label>
+            <input name="reviewed_by" value="manager">
+            <label>Note</label>
+            <textarea name="review_note" rows="3" placeholder="Optional note..."></textarea>
+          </div>
+        </div>
+
+        <button name="action" value="APPROVE">Approve (deduct stock)</button>
+        <button name="action" value="DENY" style="margin-left:8px;">Deny</button>
+      </form>
+    </div>
+    """
+    c.close()
+    return render_template_string(BASE, body=body)
+
+
+@APP.get("/reports/stock")
+def report_stock():
+    c = conn()
+    rows = c.execute("SELECT item_name, unit, stock_on_hand FROM v_stock_on_hand ORDER BY item_name").fetchall()
+    table_rows = "".join([f"<tr><td>{r['item_name']}</td><td>{r['unit']}</td><td>{float(r['stock_on_hand']):.2f}</td></tr>" for r in rows])
+
+    body = f"""
+    <div class="card">
+      <h3>Report: Current Stock</h3>
+      <table>
+        <thead><tr><th>Item</th><th>Unit</th><th>Stock On Hand</th></tr></thead>
+        <tbody>{table_rows}</tbody>
+      </table>
+    </div>
+    """
+    c.close()
+    return render_template_string(BASE, body=body)
+
+
+if __name__ == "__main__":
+    init_db()
+    APP.run(host="0.0.0.0", port=5000, debug=True)

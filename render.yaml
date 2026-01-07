@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: church-pantry
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT pantry_app:APP
+    envVars:
+      - key: PANTRY_MANAGER_PASSWORD
+        value: ChangeMe123!
