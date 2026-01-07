@@ -5,6 +5,13 @@ import sqlite3
 APP = Flask(__name__)
 DB = os.environ.get("PANTRY_DB_PATH", "/tmp/church_pantry.db")
 
+def raw_conn():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys = ON;")
+    return c
+
+
 _DB_READY = False
 
 def ensure_db():
@@ -41,16 +48,13 @@ def manager_protect(fn):
     return wrapper
 
 
-def conn():
-    ensure_db()
+def raw_conn():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys = ON;")
     return c
-
-
 def init_db():
-    c = conn()
+    c = raw_conn()
     c.executescript("""
     PRAGMA foreign_keys = ON;
 
