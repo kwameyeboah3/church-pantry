@@ -12,6 +12,14 @@ def raw_conn():
     return c
 
 
+def conn():
+    # Normal app connection used everywhere else
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys = ON;")
+    return c
+
+
 _DB_READY = False
 
 def ensure_db():
