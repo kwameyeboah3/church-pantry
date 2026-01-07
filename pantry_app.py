@@ -3,7 +3,7 @@ from flask import Flask, request, redirect, url_for, render_template_string, abo
 import sqlite3
 
 APP = Flask(__name__)
-DB = "church_pantry.db"
+DB = "/tmp/church_pantry.db"
 
 import base64
 from functools import wraps
