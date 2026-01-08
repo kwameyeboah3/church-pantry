@@ -51,6 +51,7 @@ def ensure_db():
         return
     # Create tables + seed data if needed
     init_db()
+    migrate_schema()
     _DB_READY = True
 
 import base64
