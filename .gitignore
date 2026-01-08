@@ -8,3 +8,14 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# local databases / backups
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.bak_*
+*.BROKEN_BACKUP.py
+pantry_app.py.broken_*.py
+data/
+__pycache__/
