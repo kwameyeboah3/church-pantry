@@ -257,6 +257,25 @@ BASE = """
 
 
 @APP.before_request
+
+def migrate_schema():
+    """
+    Safe SQLite migrations (Render may start with a fresh DB).
+    Adds columns that newer code expects.
+    """
+    c = raw_conn()
+    # --- items table columns ---
+    cols = [r[1] for r in c.execute("PRAGMA table_info(items);").fetchall()]
+
+    if "image_url" not in cols:
+        c.execute("ALTER TABLE items ADD COLUMN image_url TEXT")
+    if "is_active" not in cols:
+        # default active
+        c.execute("ALTER TABLE items ADD COLUMN is_active INTEGER DEFAULT 1")
+
+    # You can add more migrations here later if you change schema.
+    c.commit()
+    c.close()
 def _ensure_db_before_request():
     ensure_db()
 
