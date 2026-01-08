@@ -19,3 +19,7 @@ venv/
 pantry_app.py.broken_*.py
 data/
 __pycache__/
+
+# uploaded item images
+static/items/
+

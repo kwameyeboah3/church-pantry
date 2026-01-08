@@ -27,7 +27,7 @@ def save_item_image(file_storage, item_name: str) -> str:
     return f"/static/items/{out_name}"
 
 
-DB = os.environ.get("PANTRY_DB_PATH", "/var/data/church_pantry.db")
+DB = os.environ.get('PANTRY_DB_PATH', '/tmp/church_pantry.db')
 def raw_conn():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
