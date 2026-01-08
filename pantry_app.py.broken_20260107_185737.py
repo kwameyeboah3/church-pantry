@@ -449,26 +449,33 @@ def manager_stock():
             unit = (request.form.get("new_unit") or "unit").strip()
             qty = float(request.form.get("new_qty") or 0)
 
-            if not item_name:
+            if not name:
                 msg = "Item name is required."
             else:
                 img_url = ""
                 if "new_image" in request.files:
-                    img_url = save_item_image(request.files.get("new_image"), item_name)
+                    img_url = save_item_image(request.files.get("new_image"), name)
 
                 c = conn()
                 c.execute(
                     "INSERT OR IGNORE INTO items(item_name, unit, image_url) VALUES (?,?,?)",
                     (item_name, unit, img_url)
-                )
-
-                # Add intake as stock movement
+                # add intake as stock movement
                 row = c.execute("SELECT item_id FROM items WHERE item_name=?", (item_name,)).fetchone()
-                if row is not None and float(qty) != 0:
-                    c.execute(
-                        "INSERT INTO stock_movements (item_id, movement_type, qty) VALUES (?,?,?)",
-                        (row["item_id"], "IN", float(qty))
-                    )
+                if row is not None and qty and float(qty) != 0:
+                    c.execute("INSERT INTO stock_movements (item_id,movement_type,qty) VALUES (?,?,?)", (row['item_id'], 'IN', float(qty)))
+
+                # add intake as stock movement
+                row = c.execute("SELECT item_id FROM items WHERE item_name=?", (item_name,)).fetchone()
+                if row is not None and qty and float(qty) != 0:
+                    c.execute("INSERT INTO stock_movements (item_id,movement_type,qty) VALUES (?,?,?)", (row['item_id'], 'IN', float(qty)))
+
+                )
+                # add intake as stock transaction
+                row = c.execute("SELECT item_id FROM items WHERE item_name=?", (item_name,)).fetchone()
+                if row and qty and float(qty) != 0:
+                    c.execute("INSERT INTO transactions (item_id, tx_type, qty) VALUES (?,?,?)", (row["item_id"], "IN", float(qty)))
+
                 if img_url:
                     c.execute("UPDATE items SET image_url = ? WHERE item_name = ?", (img_url, item_name))
                 c.commit()
@@ -487,14 +494,10 @@ def manager_stock():
             else:
                 item_name = it["item_name"]
                 img_url = ""
-                # Add intake as stock movement
-                if float(qty_delta) != 0:
-                    c.execute(
-                        "INSERT INTO stock_movements (item_id, movement_type, qty) VALUES (?,?,?)",
-                        (item_id, "IN", float(qty_delta))
-                    )
                 if "update_image" in request.files:
                     img_url = save_item_image(request.files.get("update_image"), item_name)
+
+                c.execute("INSERT INTO transactions (item_id, tx_type, qty) VALUES (?,?,?)", (item_id, "IN", qty_delta))
                 if img_url:
                     c.execute("UPDATE items SET image_url = ? WHERE item_id=?", (img_url, item_id))
                 c.commit()
@@ -503,7 +506,7 @@ def manager_stock():
 
     c = conn()
     items = c.execute(
-        "SELECT i.item_id, i.item_name, i.unit, COALESCE(i.image_url,'') AS image_url, COALESCE((SELECT SUM(CASE WHEN sm.movement_type='IN' THEN sm.qty ELSE -sm.qty END) FROM stock_movements sm WHERE sm.item_id=i.item_id), 0) AS qty_available FROM items i ORDER BY i.item_name"
+        "SELECT item_id, item_name, unit, COALESCE(image_url,'') AS image_url FROM items ORDER BY item_name"
     ).fetchall()
     c.close()
 

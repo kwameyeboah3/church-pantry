@@ -27,7 +27,8 @@ def save_item_image(file_storage, item_name: str) -> str:
     return f"/static/items/{out_name}"
 
 
-DB = os.environ.get("PANTRY_DB_PATH", "/var/data/church_pantry.db")
+DB = os.environ.get("PANTRY_DB_PATH", os.path.join(os.path.dirname(__file__), "church_pantry.db"))
+
 def raw_conn():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
@@ -436,7 +437,7 @@ def member_request():
 def manager_stock():
     """
     Manager Intake:
-      - Add NEW item (item_name, unit, starting qty, optional image upload)
+      - Add NEW item (name, unit, starting qty, optional image upload)
       - Update EXISTING item stock (qty delta) and optionally update image
     """
     msg = ""
@@ -445,65 +446,54 @@ def manager_stock():
         action = (request.form.get("action") or "").strip()
 
         if action == "add_new":
-            item_name = (request.form.get("new_name") or "").strip()
+            name = (request.form.get("new_name") or "").strip()
             unit = (request.form.get("new_unit") or "unit").strip()
             qty = float(request.form.get("new_qty") or 0)
 
-            if not item_name:
+            if not name:
                 msg = "Item name is required."
             else:
                 img_url = ""
                 if "new_image" in request.files:
-                    img_url = save_item_image(request.files.get("new_image"), item_name)
+                    img_url = save_item_image(request.files.get("new_image"), name)
 
                 c = conn()
                 c.execute(
                     "INSERT OR IGNORE INTO items(item_name, unit, image_url) VALUES (?,?,?)",
-                    (item_name, unit, img_url)
+                    (name, unit, 0, img_url)
                 )
-
-                # Add intake as stock movement
-                row = c.execute("SELECT item_id FROM items WHERE item_name=?", (item_name,)).fetchone()
-                if row is not None and float(qty) != 0:
-                    c.execute(
-                        "INSERT INTO stock_movements (item_id, movement_type, qty) VALUES (?,?,?)",
-                        (row["item_id"], "IN", float(qty))
-                    )
+                c.execute("UPDATE items SET image_url = COALESCE(image_url, image_url) WHERE item_name = item_name", (qty, name))
                 if img_url:
-                    c.execute("UPDATE items SET image_url = ? WHERE item_name = ?", (img_url, item_name))
+                    c.execute("UPDATE items SET image_url = ? WHERE item_name = ?", (img_url, name))
                 c.commit()
                 c.close()
-                msg = f"Added/updated item '{item_name}' with +{qty} stock."
+                msg = f"Added/updated item '{name}' with +{qty} stock."
 
         elif action == "update_existing":
             item_id = int(request.form.get("item_id") or 0)
             qty_delta = float(request.form.get("qty_delta") or 0)
 
             c = conn()
-            it = c.execute("SELECT item_id, item_name FROM items WHERE item_id=?", (item_id,)).fetchone()
+            it = c.execute("SELECT item_id, name FROM items WHERE item_id=?", (item_id,)).fetchone()
             if not it:
                 msg = "Item not found."
                 c.close()
             else:
-                item_name = it["item_name"]
+                name = it["name"]
                 img_url = ""
-                # Add intake as stock movement
-                if float(qty_delta) != 0:
-                    c.execute(
-                        "INSERT INTO stock_movements (item_id, movement_type, qty) VALUES (?,?,?)",
-                        (item_id, "IN", float(qty_delta))
-                    )
                 if "update_image" in request.files:
-                    img_url = save_item_image(request.files.get("update_image"), item_name)
+                    img_url = save_item_image(request.files.get("update_image"), name)
+
+                c.execute("UPDATE items SET  qty_available + ? WHERE item_id=?", (qty_delta, item_id))
                 if img_url:
                     c.execute("UPDATE items SET image_url = ? WHERE item_id=?", (img_url, item_id))
                 c.commit()
                 c.close()
-                msg = f"Updated '{item_name}' stock by {qty_delta}."
+                msg = f"Updated '{name}' stock by {qty_delta}."
 
     c = conn()
     items = c.execute(
-        "SELECT i.item_id, i.item_name, i.unit, COALESCE(i.image_url,'') AS image_url, COALESCE((SELECT SUM(CASE WHEN sm.movement_type='IN' THEN sm.qty ELSE -sm.qty END) FROM stock_movements sm WHERE sm.item_id=i.item_id), 0) AS qty_available FROM items i ORDER BY i.item_name"
+        "SELECT item_id, name, unit, , COALESCE(image_url,'') AS image_url FROM items ORDER BY item_name"
     ).fetchall()
     c.close()
 
@@ -824,5 +814,8 @@ def report_stock():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    APP.run(host="0.0.0.0", port=port, debug=True)
+    init_db()
+    APP.run(host="0.0.0.0", port=5000, debug=True)
+
+
+

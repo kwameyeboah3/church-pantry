@@ -27,7 +27,8 @@ def save_item_image(file_storage, item_name: str) -> str:
     return f"/static/items/{out_name}"
 
 
-DB = os.environ.get("PANTRY_DB_PATH", "/var/data/church_pantry.db")
+DB = os.environ.get("PANTRY_DB_PATH", os.path.join(os.path.dirname(__file__), "church_pantry.db"))
+
 def raw_conn():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
@@ -275,14 +276,9 @@ def get_stock_map():
 @APP.route("/member/request", methods=["GET", "POST"])
 def member_request():
     c = conn()
-
-    # Items (A+B): show as cards and hide out-of-stock
-    items = c.execute(
-        "SELECT item_id, item_name, unit, image_url FROM items WHERE is_active=1 ORDER BY item_name"
-    ).fetchall()
+    items = c.execute("SELECT item_id, item_name, unit, image_url FROM items WHERE is_active=1 ORDER BY item_name").fetchall()
     stock = get_stock_map()
-    items = [it for it in items if stock.get(it["item_id"], 0.0) > 0]
-
+    items = [it for it in items if stock.get(it['item_id'], 0.0) > 0]
     if request.method == "POST":
         member_name = (request.form.get("member_name") or "").strip()
         member_phone = (request.form.get("member_phone") or "").strip()
@@ -302,7 +298,7 @@ def member_request():
         first_name = parts[0]
         last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
 
-        # Find existing member by phone first
+        # Find existing member primarily by phone, else by name
         row = c.execute(
             "SELECT member_id FROM members WHERE phone = ? LIMIT 1",
             (member_phone,)
@@ -311,37 +307,43 @@ def member_request():
         if row:
             member_id = row["member_id"]
         else:
-            # create new member_code like WEB-000001
-            mx = c.execute("SELECT COALESCE(MAX(member_id), 0) AS mx FROM members").fetchone()["mx"]
-            member_code = f"WEB-{mx+1:06d}"
-            cur = c.execute(
-                "INSERT INTO members (member_code, first_name, last_name, phone) VALUES (?,?,?,?)",
-                (member_code, first_name, last_name, member_phone)
-            )
-            member_id = cur.lastrowid
+            row2 = c.execute(
+                "SELECT member_id FROM members WHERE first_name = ? AND last_name = ? LIMIT 1",
+                (first_name, last_name)
+            ).fetchone()
+
+            if row2:
+                member_id = row2["member_id"]
+            else:
+                # Create a new member_code automatically
+                # Example: WEB-000123
+                max_id = c.execute("SELECT COALESCE(MAX(member_id), 0) AS mx FROM members").fetchone()["mx"]
+                member_code = f"WEB-{max_id+1:06d}"
+
+                cur = c.execute(
+                    "INSERT INTO members (member_code, first_name, last_name, phone) VALUES (?,?,?,?)",
+                    (member_code, first_name, last_name, member_phone)
+                )
+                member_id = cur.lastrowid
 
         selections = []
         for it in items:
             key = f"qty_{it['item_id']}"
             raw = (request.form.get(key) or "").strip()
-            if not raw:
-                continue
-            try:
-                qty = float(raw)
-            except ValueError:
-                continue
-            if qty > 0:
-                selections.append((it["item_id"], qty))
+            if raw:
+                try:
+                    qty = float(raw)
+                except ValueError:
+                    continue
+                if qty > 0:
+                    selections.append((it["item_id"], qty))
 
         if not selections:
             body = "<p class='bad'>Please enter at least one item quantity.</p>"
             c.close()
             return render_template_string(BASE, body=body)
 
-        cur = c.execute(
-            "INSERT INTO requests (member_id, status) VALUES (?, 'SUBMITTED')",
-            (member_id,)
-        )
+        cur = c.execute("INSERT INTO requests (member_id, status) VALUES (?, 'SUBMITTED')", (member_id,))
         req_id = cur.lastrowid
 
         for item_id, qty in selections:
@@ -360,23 +362,29 @@ def member_request():
         """
         return render_template_string(BASE, body=body)
 
-    # GET: show the form
-    cards = ""
+    options =
+    options = ''cards = ""
     for it in items:
-        img_url = it["image_url"] if "image_url" in it.keys() else None
-        if img_url:
-            img_html = f"<img src='{img_url}' alt='{it['item_name']}' style='width:100%;height:100%;object-fit:contain;background:#fff;'>"
-        else:
-            img_html = "<div style='color:#777;font-size:13px;'>No Image</div>"
+         available = stock.get(it["item_id"], 0.0)
 
-        cards += f"""
-        <div class="item">
+         img_url = it["image_url"] if ("image_url" in it.keys() and it["image_url"]) else ""
+         if img_url:
+             img_html = f"<img src='{img_url}' alt='{it['item_name']}' style='width:100%;height:100%;object-fit:contain;background:#fff;'>"
+         else:
+             img_html = "<div style='color:#777;font-size:13px;'>No Image</div>"
+
+         cards += f"""
+         <div class="item">
           <div class="imgbox">{img_html}</div>
           <div class="iname">{it['item_name']}</div>
-          <div class="meta">Unit: {it['unit']}</div>
-          <input class="qty" type="number" step="1" min="0" name="qty_{it['item_id']}" value="0">
-        </div>
-        """
+          <div class="meta">
+            Unit: {it['unit']}<br>
+            
+          </div>
+          <input class="qty" type="number" step="1" min="0" max="{available:.0f}" name="qty_{it['item_id']}" value="0">
+         </div>
+         """
+
 
     body = f"""
     <style>
@@ -385,58 +393,57 @@ def member_request():
         grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
         gap: 16px;
         margin-top: 12px;
-      }}
-      .item {{
-        border: 1px solid #e3e3e3;
-        border-radius: 12px;
-        padding: 12px;
-        background: #fff;
-      }}
-      .imgbox {{
-        height: 150px;
-        border-radius: 10px;
-        background: #f3f3f3;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        overflow: hidden;
-        margin-bottom: 10px;
-      }}
-      .iname {{ font-weight: 700; margin-bottom: 4px; }}
-      .meta {{ color: #444; font-size: 13px; margin-bottom: 8px; }}
-      .qty {{ width: 100%; padding: 8px; font-size: 14px; }}
-      .field {{ width: 100%; padding: 10px; font-size: 14px; margin-bottom: 10px; }}
-      label {{ display:block; margin-top:10px; margin-bottom:6px; font-weight:600; }}
-    </style>
+    }}
+    .item {{
+      border: 1px solid #e3e3e3;
+      border-radius: 12px;
+      padding: 12px;
+      background: #fff;
+    }}
+    .imgbox {{
+      height: 150px;
+      border-radius: 10px;
+      background: #f3f3f3;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      margin-bottom: 10px;
+    }}
+    .iname {{ font-weight: 700; margin-bottom: 4px; }}
+    .meta {{ color: #444; font-size: 13px; margin-bottom: 8px; }}
+    .qty {{ width: 100%; padding: 8px; font-size: 14px; }}
+  </style>
 
-    <div class="card">
-      <h3>Member Request Form</h3>
-      <form method="POST">
-        <label>Full Name</label>
-        <input class="field" type="text" name="member_name" placeholder="Type your full name" required>
+  <div class="card">
+    <h3>Member Request Form</h3>
+    <form method="POST">
+      <label>Member</label>
+      <select name="member_id" required>{options}</select>
 
-        <label>Phone Number</label>
-        <input class="field" type="tel" name="member_phone" placeholder="Type your phone number" required>
+      <h4>Select Item Requested</h4>
 
-        <h4>Select Item Requested</h4>
-        <div class="grid">
-          {cards}
-        </div>
+      <div class="grid">
+        {cards}
+      </div>
 
-        <button type="submit">Submit Request</button>
-      </form>
-    </div>
-    """
+      <button type="submit">Submit Request</button>
+    </form>
+  </div>
+  """
 
     c.close()
     return render_template_string(BASE, body=body)
+
+
+
 
 @APP.route("/manager/stock", methods=["GET","POST"])
 @requires_manager_auth
 def manager_stock():
     """
     Manager Intake:
-      - Add NEW item (item_name, unit, starting qty, optional image upload)
+      - Add NEW item (name, unit, starting qty, optional image upload)
       - Update EXISTING item stock (qty delta) and optionally update image
     """
     msg = ""
@@ -445,65 +452,54 @@ def manager_stock():
         action = (request.form.get("action") or "").strip()
 
         if action == "add_new":
-            item_name = (request.form.get("new_name") or "").strip()
+            name = (request.form.get("new_name") or "").strip()
             unit = (request.form.get("new_unit") or "unit").strip()
             qty = float(request.form.get("new_qty") or 0)
 
-            if not item_name:
+            if not name:
                 msg = "Item name is required."
             else:
                 img_url = ""
                 if "new_image" in request.files:
-                    img_url = save_item_image(request.files.get("new_image"), item_name)
+                    img_url = save_item_image(request.files.get("new_image"), name)
 
                 c = conn()
                 c.execute(
                     "INSERT OR IGNORE INTO items(item_name, unit, image_url) VALUES (?,?,?)",
-                    (item_name, unit, img_url)
+                    (name, unit, 0, img_url)
                 )
-
-                # Add intake as stock movement
-                row = c.execute("SELECT item_id FROM items WHERE item_name=?", (item_name,)).fetchone()
-                if row is not None and float(qty) != 0:
-                    c.execute(
-                        "INSERT INTO stock_movements (item_id, movement_type, qty) VALUES (?,?,?)",
-                        (row["item_id"], "IN", float(qty))
-                    )
+                c.execute("UPDATE items SET image_url = COALESCE(image_url, image_url) WHERE item_name = item_name", (qty, name))
                 if img_url:
-                    c.execute("UPDATE items SET image_url = ? WHERE item_name = ?", (img_url, item_name))
+                    c.execute("UPDATE items SET image_url = ? WHERE item_name = ?", (img_url, name))
                 c.commit()
                 c.close()
-                msg = f"Added/updated item '{item_name}' with +{qty} stock."
+                msg = f"Added/updated item '{name}' with +{qty} stock."
 
         elif action == "update_existing":
             item_id = int(request.form.get("item_id") or 0)
             qty_delta = float(request.form.get("qty_delta") or 0)
 
             c = conn()
-            it = c.execute("SELECT item_id, item_name FROM items WHERE item_id=?", (item_id,)).fetchone()
+            it = c.execute("SELECT item_id, name FROM items WHERE item_id=?", (item_id,)).fetchone()
             if not it:
                 msg = "Item not found."
                 c.close()
             else:
-                item_name = it["item_name"]
+                name = it["name"]
                 img_url = ""
-                # Add intake as stock movement
-                if float(qty_delta) != 0:
-                    c.execute(
-                        "INSERT INTO stock_movements (item_id, movement_type, qty) VALUES (?,?,?)",
-                        (item_id, "IN", float(qty_delta))
-                    )
                 if "update_image" in request.files:
-                    img_url = save_item_image(request.files.get("update_image"), item_name)
+                    img_url = save_item_image(request.files.get("update_image"), name)
+
+                c.execute("UPDATE items SET  qty_available + ? WHERE item_id=?", (qty_delta, item_id))
                 if img_url:
                     c.execute("UPDATE items SET image_url = ? WHERE item_id=?", (img_url, item_id))
                 c.commit()
                 c.close()
-                msg = f"Updated '{item_name}' stock by {qty_delta}."
+                msg = f"Updated '{name}' stock by {qty_delta}."
 
     c = conn()
     items = c.execute(
-        "SELECT i.item_id, i.item_name, i.unit, COALESCE(i.image_url,'') AS image_url, COALESCE((SELECT SUM(CASE WHEN sm.movement_type='IN' THEN sm.qty ELSE -sm.qty END) FROM stock_movements sm WHERE sm.item_id=i.item_id), 0) AS qty_available FROM items i ORDER BY i.item_name"
+        "SELECT item_id, name, unit, , COALESCE(image_url,'') AS image_url FROM items ORDER BY item_name"
     ).fetchall()
     c.close()
 
@@ -824,5 +820,8 @@ def report_stock():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    APP.run(host="0.0.0.0", port=port, debug=True)
+    init_db()
+    APP.run(host="0.0.0.0", port=5000, debug=True)
+
+
+
