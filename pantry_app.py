@@ -49,9 +49,14 @@ def ensure_db():
     global _DB_READY
     if _DB_READY:
         return
-    # Create tables + seed data if needed
+    # 1) Create base tables (safe if already exists)
     init_db()
-    migrate_schema()
+    # 2) Apply safe migrations (only alters if needed)
+    try:
+        migrate_schema()
+    except Exception as e:
+        # Don't crash the whole app if migration is unnecessary or partially applied
+        print("migrate_schema() warning:", e)
     _DB_READY = True
 
 import base64
@@ -265,14 +270,32 @@ def migrate_schema():
     Adds columns that newer code expects.
     """
     c = raw_conn()
+    # If base tables aren't created yet, do nothing (init_db will handle)
+    row = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='items'").fetchone()
+    if not row:
+        c.close()
+        return
+
     # --- items table columns ---
     cols = [r[1] for r in c.execute("PRAGMA table_info(items);").fetchall()]
 
     if "image_url" not in cols:
-        c.execute("ALTER TABLE items ADD COLUMN image_url TEXT")
+        try:
+
+            c.execute("ALTER TABLE items ADD COLUMN image_url TEXT")
+
+        except Exception:
+
+            pass
     if "is_active" not in cols:
         # default active
-        c.execute("ALTER TABLE items ADD COLUMN is_active INTEGER DEFAULT 1")
+        try:
+
+            c.execute("ALTER TABLE items ADD COLUMN is_active INTEGER DEFAULT 1")
+
+        except Exception:
+
+            pass
 
     # You can add more migrations here later if you change schema.
     c.commit()
