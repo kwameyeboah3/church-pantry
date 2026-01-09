@@ -524,6 +524,44 @@ BASE = """
     .bar-label { width: 120px; font-size: 13px; color: var(--muted); }
     .bar-track { flex: 1; height: 10px; background: #e6ebf5; border-radius: 999px; overflow: hidden; }
     .bar { height: 10px; background: linear-gradient(90deg, #0b2c5f, #d4a017); border-radius: 999px; }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(280px, 1.1fr) minmax(240px, 0.9fr);
+      gap: 16px;
+      align-items: center;
+      padding: 18px;
+      background: linear-gradient(120deg, rgba(11,44,95,0.08), rgba(212,160,23,0.12));
+      border: 1px solid rgba(11,44,95,0.15);
+    }
+    .hero h3 { margin: 0 0 8px; font-size: 26px; }
+    .hero p { margin: 0 0 10px; }
+    .hero-card {
+      padding: 14px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.9);
+      border: 1px solid var(--line);
+      text-align: center;
+    }
+    .hero-badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .hero-badge {
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: #0b2c5f;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+    }
+    .hero-image {
+      width: 100%;
+      height: 360px;
+      border-radius: 18px;
+      object-fit: cover;
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+      margin-top: 16px;
+    }
     @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     @media (max-width: 720px) {
       .site-header { position: static; }
@@ -582,6 +620,7 @@ def home():
           <span class="hero-badge">Care</span>
           <span class="hero-badge">Stewardship</span>
         </div>
+        <img class="hero-image" src="/static/hero_pantry.jpg" alt="Sharing food and pantry support" />
       </div>
       <div class="hero-card">
         <svg width="220" height="140" viewBox="0 0 220 140" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Community care">
