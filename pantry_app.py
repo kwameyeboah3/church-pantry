@@ -2,12 +2,13 @@ import csv
 import io
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, redirect, url_for, render_template_string, Response, abort, session
 from email.message import EmailMessage
 import smtplib
 from flask import send_from_directory
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # ============================================================
 # Config
@@ -80,6 +81,22 @@ def send_email(to_email: str, subject: str, body: str):
         s.send_message(msg)
 
 
+def get_manager_emails() -> list[str]:
+    c = conn()
+    try:
+        rows = c.execute(
+            "SELECT email FROM managers WHERE is_active=1 AND email IS NOT NULL AND email != ''"
+        ).fetchall()
+    finally:
+        c.close()
+    emails = [r["email"] for r in rows]
+    if not emails:
+        fallback = os.environ.get("MANAGER_EMAIL")
+        if fallback:
+            emails = [fallback]
+    return emails
+
+
 def csv_response(filename: str, rows: list[list[str]]) -> Response:
     output = io.StringIO()
     writer = csv.writer(output)
@@ -90,9 +107,9 @@ def csv_response(filename: str, rows: list[list[str]]) -> Response:
     return resp
 
 def notify_manager_new_request(req_id: int, member_name: str, phone: str, email: str):
-    manager_email = os.environ.get("MANAGER_EMAIL")
-    if not manager_email:
-        print("⚠️ MANAGER_EMAIL not set; manager notification skipped.")
+    manager_emails = get_manager_emails()
+    if not manager_emails:
+        print("⚠️ Manager email not set; manager notification skipped.")
         return
     subject = f"New Pantry Request #{req_id}"
     body = (
@@ -104,7 +121,8 @@ def notify_manager_new_request(req_id: int, member_name: str, phone: str, email:
         f"Open approvals:\n"
         f"{os.environ.get('PUBLIC_BASE_URL','http://127.0.0.1:5000')}/manager/requests\n"
     )
-    send_email(manager_email, subject, body)
+    for manager_email in manager_emails:
+        send_email(manager_email, subject, body)
 
 def acknowledge_requester(req_id: int, requester_email: str, member_name: str):
     subject = f"Pantry Request Received (#{req_id})"
@@ -113,6 +131,17 @@ def acknowledge_requester(req_id: int, requester_email: str, member_name: str):
         f"We received your pantry request (Request #{req_id}).\n"
         f"Our pantry manager will review and approve/reject it.\n\n"
         f"Thank you.\n"
+    )
+    send_email(requester_email, subject, body)
+
+
+def notify_request_rejected(req_id: int, requester_email: str, member_name: str, reason: str):
+    subject = f"Pantry Request Update (#{req_id})"
+    body = (
+        f"Hello {member_name},\n\n"
+        f"Your pantry request (Request #{req_id}) was not approved.\n"
+        f"Reason: {reason or 'Not provided'}\n\n"
+        f"Please contact the pantry manager if you have questions.\n"
     )
     send_email(requester_email, subject, body)
 
@@ -159,6 +188,7 @@ def init_db():
                 item_name     TEXT NOT NULL UNIQUE,
                 unit          TEXT NOT NULL,
                 qty_available REAL NOT NULL DEFAULT 0,
+                unit_cost     REAL,
                 is_active     INTEGER NOT NULL DEFAULT 1,
                 image_url     TEXT,
                 expiry_date   TEXT,  -- optional, 'YYYY-MM-DD'
@@ -181,10 +211,20 @@ def init_db():
                 member_id    INTEGER NOT NULL,
                 status       TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/APPROVED/REJECTED
                 note         TEXT,
+                reject_reason TEXT,
                 created_at   TEXT NOT NULL DEFAULT (datetime('now')),
                 decided_at   TEXT,
                 decided_by   TEXT,
                 FOREIGN KEY(member_id) REFERENCES members(member_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS managers (
+                manager_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                username      TEXT NOT NULL UNIQUE,
+                email         TEXT,
+                password_hash TEXT NOT NULL,
+                is_active     INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             CREATE TABLE IF NOT EXISTS request_items (
@@ -208,6 +248,12 @@ def init_db():
             c.execute("ALTER TABLE items ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
         if "qty_available" not in cols:
             c.execute("ALTER TABLE items ADD COLUMN qty_available REAL NOT NULL DEFAULT 0")
+        if "unit_cost" not in cols:
+            c.execute("ALTER TABLE items ADD COLUMN unit_cost REAL")
+
+        req_cols = {r["name"] for r in c.execute("PRAGMA table_info(requests)").fetchall()}
+        if "reject_reason" not in req_cols:
+            c.execute("ALTER TABLE requests ADD COLUMN reject_reason TEXT")
 
         c.commit()
     finally:
@@ -230,11 +276,70 @@ def _ensure_db_before_request():
 # ============================================================
 # Auth
 # ============================================================
+def get_current_manager():
+    manager_id = session.get("manager_id")
+    if not manager_id:
+        return None
+    c = conn()
+    try:
+        row = c.execute(
+            "SELECT manager_id, username, email, is_active FROM managers WHERE manager_id=?",
+            (manager_id,),
+        ).fetchone()
+    finally:
+        c.close()
+    if not row or row["is_active"] != 1:
+        session.pop("manager_id", None)
+        session.pop("manager_username", None)
+        return None
+    return row
+
+
+def has_managers() -> bool:
+    c = conn()
+    try:
+        row = c.execute("SELECT COUNT(*) AS cnt FROM managers").fetchone()
+    finally:
+        c.close()
+    return (row["cnt"] or 0) > 0
+
+
+def ensure_default_manager():
+    if has_managers():
+        return
+    c = conn()
+    try:
+        password_hash = generate_password_hash(MANAGER_PASSWORD)
+        c.execute(
+            "INSERT INTO managers (username, email, password_hash, is_active) VALUES (?, ?, ?, 1)",
+            ("manager", os.environ.get("MANAGER_EMAIL", ""), password_hash),
+        )
+        c.commit()
+    finally:
+        c.close()
+
+
+def check_manager_credentials(username: str, password: str) -> bool:
+    if not has_managers():
+        ensure_default_manager()
+    c = conn()
+    try:
+        row = c.execute(
+            "SELECT manager_id, username, password_hash, is_active FROM managers WHERE username=?",
+            (username,),
+        ).fetchone()
+    finally:
+        c.close()
+    if not row or row["is_active"] != 1:
+        return False
+    return check_password_hash(row["password_hash"], password)
+
+
 def is_manager_logged_in() -> bool:
-    if session.get("is_manager") is True:
+    if get_current_manager():
         return True
     auth = request.authorization
-    if auth and auth.username == "manager" and auth.password == MANAGER_PASSWORD:
+    if auth and check_manager_credentials(auth.username, auth.password):
         return True
     return False
 
@@ -249,10 +354,15 @@ def requires_manager_auth(func):
     return wrapper
 
 
+def current_manager_name() -> str:
+    return session.get("manager_username") or "manager"
+
+
 @APP.context_processor
 def inject_manager_auth():
     return {
         "is_manager": is_manager_logged_in(),
+        "current_manager": get_current_manager(),
         "church_name": CHURCH_NAME,
         "church_tagline": CHURCH_TAGLINE,
         "logo_url": LOGO_URL,
@@ -405,6 +515,10 @@ BASE = """
     }
     .stat-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
     .stat-value { font-size: 20px; font-weight: 700; margin-top: 6px; }
+    .bar-row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+    .bar-label { width: 120px; font-size: 13px; color: var(--muted); }
+    .bar-track { flex: 1; height: 10px; background: #e6ebf5; border-radius: 999px; overflow: hidden; }
+    .bar { height: 10px; background: linear-gradient(90deg, #0b2c5f, #d4a017); border-radius: 999px; }
     @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     @media (max-width: 720px) {
       .site-header { position: static; }
@@ -431,6 +545,8 @@ BASE = """
           <a href="{{ url_for('manager_requests') }}">Manager: Approvals</a>
           <a href="/manager/stock_view">Manager: Stock Viewer</a>
           <a href="/manager/reports">Manager: Reports</a>
+          <a href="/manager/profile">Manager: Profile</a>
+          <a href="/manager/managers">Manager: Users</a>
           <a href="/manager/logout">Manager Logout</a>
         {% else %}
           <a href="/manager/login">Manager Login</a>
@@ -462,6 +578,17 @@ def home():
           <span class="hero-badge">Stewardship</span>
         </div>
       </div>
+      <div class="hero-card">
+        <svg width="220" height="140" viewBox="0 0 220 140" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Community care">
+          <rect x="4" y="8" width="212" height="124" rx="18" fill="#f2f4ff" stroke="#0b2c5f" stroke-width="2"/>
+          <circle cx="70" cy="60" r="18" fill="#0b2c5f"/>
+          <circle cx="150" cy="60" r="18" fill="#d4a017"/>
+          <path d="M38 104 C58 84, 86 84, 106 104" fill="none" stroke="#0b2c5f" stroke-width="4"/>
+          <path d="M114 104 C134 84, 162 84, 182 104" fill="none" stroke="#d4a017" stroke-width="4"/>
+          <path d="M108 58 L112 58 L112 44 L116 44 L116 58 L120 58 L120 62 L116 62 L116 76 L112 76 L112 62 L108 62 Z" fill="#0b2c5f"/>
+        </svg>
+        <p class="muted" style="margin-top:10px;">A place of support, nourishment, and shared hope.</p>
+      </div>
     </div>
     """
     return render_template_string(BASE, body=body)
@@ -478,9 +605,19 @@ def manager_login():
         username = (request.form.get("username") or "").strip()
         password = (request.form.get("password") or "").strip()
         next_url = request.form.get("next") or next_url
-        if username == "manager" and password == MANAGER_PASSWORD:
-            session["is_manager"] = True
-            return redirect(next_url)
+        if check_manager_credentials(username, password):
+            c = conn()
+            try:
+                row = c.execute(
+                    "SELECT manager_id, username FROM managers WHERE username=?",
+                    (username,),
+                ).fetchone()
+            finally:
+                c.close()
+            if row:
+                session["manager_id"] = row["manager_id"]
+                session["manager_username"] = row["username"]
+                return redirect(next_url)
         error = "Invalid username or password."
 
     body = render_template_string(
@@ -510,8 +647,219 @@ def manager_login():
 
 @APP.get("/manager/logout")
 def manager_logout():
-    session.pop("is_manager", None)
+    session.pop("manager_id", None)
+    session.pop("manager_username", None)
     return redirect(url_for("home"))
+
+
+@APP.route("/manager/profile", methods=["GET", "POST"])
+@requires_manager_auth
+def manager_profile():
+    manager = get_current_manager()
+    if not manager:
+        return redirect(url_for("manager_login"))
+
+    message = ""
+    error = ""
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip()
+        current_password = (request.form.get("current_password") or "").strip()
+        new_password = (request.form.get("new_password") or "").strip()
+        confirm_password = (request.form.get("confirm_password") or "").strip()
+
+        c = conn()
+        try:
+            row = c.execute(
+                "SELECT password_hash FROM managers WHERE manager_id=?",
+                (manager["manager_id"],),
+            ).fetchone()
+            if not row:
+                error = "Manager not found."
+            else:
+                c.execute(
+                    "UPDATE managers SET email=? WHERE manager_id=?",
+                    (email, manager["manager_id"]),
+                )
+                if new_password:
+                    if not current_password or not check_password_hash(row["password_hash"], current_password):
+                        error = "Current password is incorrect."
+                    elif new_password != confirm_password:
+                        error = "New passwords do not match."
+                    else:
+                        c.execute(
+                            "UPDATE managers SET password_hash=? WHERE manager_id=?",
+                            (generate_password_hash(new_password), manager["manager_id"]),
+                        )
+                if not error:
+                    message = "Profile updated."
+                c.commit()
+        finally:
+            c.close()
+
+        manager = get_current_manager()
+
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Manager Profile</h3>
+          {% if message %}<p class="ok">{{ message }}</p>{% endif %}
+          {% if error %}<p class="danger">{{ error }}</p>{% endif %}
+          <form method="POST">
+            <label>Username</label>
+            <input value="{{ manager['username'] }}" disabled />
+            <label>Email</label>
+            <input name="email" value="{{ manager['email'] or '' }}" />
+            <hr style="margin:16px 0; border:0; border-top:1px solid var(--line);" />
+            <label>Current Password</label>
+            <input name="current_password" type="password" />
+            <label>New Password</label>
+            <input name="new_password" type="password" />
+            <label>Confirm New Password</label>
+            <input name="confirm_password" type="password" />
+            <p style="margin-top:12px;">
+              <button class="btn btn-primary" type="submit">Save Changes</button>
+            </p>
+          </form>
+        </div>
+        """,
+        manager=manager,
+        message=message,
+        error=error,
+    )
+    return render_template_string(BASE, body=body)
+
+
+@APP.route("/manager/managers", methods=["GET", "POST"])
+@requires_manager_auth
+def manager_users():
+    message = ""
+    error = ""
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "add":
+            username = (request.form.get("username") or "").strip()
+            email = (request.form.get("email") or "").strip()
+            password = (request.form.get("password") or "").strip()
+            if not username or not password:
+                error = "Username and password are required."
+            else:
+                c = conn()
+                try:
+                    existing = c.execute(
+                        "SELECT manager_id FROM managers WHERE username=?",
+                        (username,),
+                    ).fetchone()
+                    if existing:
+                        error = "Username already exists."
+                    else:
+                        c.execute(
+                            "INSERT INTO managers (username, email, password_hash, is_active) VALUES (?, ?, ?, 1)",
+                            (username, email, generate_password_hash(password)),
+                        )
+                        c.commit()
+                        message = "Manager added."
+                finally:
+                    c.close()
+        elif action == "toggle":
+            manager_id = int(request.form.get("manager_id") or 0)
+            c = conn()
+            try:
+                current = get_current_manager()
+                if current and current["manager_id"] == manager_id:
+                    error = "You cannot deactivate your own account."
+                else:
+                    active_count = c.execute(
+                        "SELECT COUNT(*) AS cnt FROM managers WHERE is_active=1"
+                    ).fetchone()["cnt"]
+                    target = c.execute(
+                        "SELECT is_active FROM managers WHERE manager_id=?",
+                        (manager_id,),
+                    ).fetchone()
+                    if not target:
+                        error = "Manager not found."
+                    else:
+                        new_state = 0 if target["is_active"] == 1 else 1
+                        if new_state == 0 and active_count <= 1:
+                            error = "At least one active manager is required."
+                        else:
+                            c.execute(
+                                "UPDATE managers SET is_active=? WHERE manager_id=?",
+                                (new_state, manager_id),
+                            )
+                            c.commit()
+                            message = "Manager updated."
+            finally:
+                c.close()
+
+    c = conn()
+    try:
+        managers = c.execute(
+            "SELECT manager_id, username, email, is_active, created_at FROM managers ORDER BY username"
+        ).fetchall()
+    finally:
+        c.close()
+
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Manager Users</h3>
+          {% if message %}<p class="ok">{{ message }}</p>{% endif %}
+          {% if error %}<p class="danger">{{ error }}</p>{% endif %}
+
+          <h4>Add Manager</h4>
+          <form method="POST">
+            <input type="hidden" name="action" value="add" />
+            <div class="row">
+              <div>
+                <label>Username</label>
+                <input name="username" required />
+              </div>
+              <div>
+                <label>Email</label>
+                <input name="email" type="email" />
+              </div>
+              <div>
+                <label>Password</label>
+                <input name="password" type="password" required />
+              </div>
+            </div>
+            <p style="margin-top:12px;">
+              <button class="btn btn-primary" type="submit">Add Manager</button>
+            </p>
+          </form>
+        </div>
+
+        <div class="card">
+          <h4>Existing Managers</h4>
+          <table>
+            <tr><th>Username</th><th>Email</th><th>Status</th><th>Created</th><th>Action</th></tr>
+            {% if managers|length == 0 %}
+              <tr><td colspan="5" class="muted">No managers found.</td></tr>
+            {% else %}
+              {% for m in managers %}
+                <tr>
+                  <td>{{ m["username"] }}</td>
+                  <td>{{ m["email"] or "-" }}</td>
+                  <td>{% if m["is_active"] == 1 %}Active{% else %}Inactive{% endif %}</td>
+                  <td>{{ m["created_at"] }}</td>
+                  <td>
+                    <form method="POST" style="margin:0;">
+                      <input type="hidden" name="action" value="toggle" />
+                      <input type="hidden" name="manager_id" value="{{ m['manager_id'] }}" />
+                      <button class="btn" type="submit">{% if m["is_active"] == 1 %}Deactivate{% else %}Activate{% endif %}</button>
+                    </form>
+                  </td>
+                </tr>
+              {% endfor %}
+            {% endif %}
+          </table>
+        </div>
+        """,
+        managers=managers,
+        message=message,
+        error=error,
+    )
+    return render_template_string(BASE, body=body)
 
 
 @APP.get("/member/request")
@@ -533,7 +881,7 @@ def member_request():
         """
         <div class="card">
           <h3>Member Request Form</h3>
-          <form method="POST" action="{{ url_for('member_request_submit') }}">
+          <form method="POST" action="{{ url_for('member_request_preview') }}">
             <div class="row">
               <div>
                 <label>Your Name *</label>
@@ -554,20 +902,28 @@ def member_request():
               <p class="danger">No items available right now. Please check later.</p>
             {% else %}
               <table>
-                <tr><th>Item</th> <th>Qty you want</th></tr>
+                <tr><th>Item</th><th>Item</th></tr>
                 {% for it in items %}
-                  <tr>
-                    <td>
-                      {% if it["image_url"] %}
-                        <img src="{{ it['image_url'] }}" alt="{{ it['item_name'] }}" style="max-width:240px; max-height:240px; display:block; margin-bottom:10px;" />
-                      {% endif %}
-                      <b>{{ it["item_name"] }}</b><div class="muted">Unit: {{ it["unit"] }}</div>
-                    </td>
-                    <td>
+                  {% if loop.index0 % 2 == 0 %}
+                    <tr>
+                  {% endif %}
+                  <td>
+                    {% if it["image_url"] %}
+                      <img src="{{ it['image_url'] }}" alt="{{ it['item_name'] }}" style="max-width:240px; max-height:240px; display:block; margin-bottom:10px;" />
+                    {% endif %}
+                    <b>{{ it["item_name"] }}</b><div class="muted">Unit: {{ it["unit"] }}</div>
+                    <div style="margin-top:10px;">
+                      <label class="muted">Qty you want</label>
                       <input type="number" step="1" min="0" name="qty_{{ it['item_id'] }}" value="0" />
-                    </td>
-                  </tr>
+                    </div>
+                  </td>
+                  {% if loop.index0 % 2 == 1 %}
+                    </tr>
+                  {% endif %}
                 {% endfor %}
+                {% if items|length % 2 == 1 %}
+                  <td></td></tr>
+                {% endif %}
               </table>
             {% endif %}
 
@@ -585,7 +941,100 @@ def member_request():
     return render_template_string(BASE, body=body)
 
 
-@APP.post("/member/request")
+@APP.post("/member/request/preview")
+def member_request_preview():
+    name = (request.form.get("name") or "").strip()
+    phone = (request.form.get("phone") or "").strip()
+    email = (request.form.get("email") or "").strip()
+    note = (request.form.get("note") or "").strip()
+
+    if not name or not phone or not email:
+        abort(400, "Name, phone, and email are required.")
+
+    c = conn()
+    try:
+        items = c.execute(
+            """
+            SELECT item_id, item_name, unit, qty_available, image_url
+            FROM items
+            WHERE is_active=1 AND COALESCE(qty_available, 0) > 0
+            ORDER BY item_name
+            """
+        ).fetchall()
+    finally:
+        c.close()
+
+    selected = []
+    for it in items:
+        qty = float(request.form.get(f"qty_{it['item_id']}") or 0)
+        if qty > 0:
+            selected.append(
+                {
+                    "item_id": it["item_id"],
+                    "item_name": it["item_name"],
+                    "unit": it["unit"],
+                    "qty": qty,
+                    "image_url": it["image_url"],
+                }
+            )
+
+    if not selected:
+        body = '<div class="card danger"><b>No quantities selected.</b> Please go back and choose at least one item.</div>'
+        return render_template_string(BASE, body=body), 400
+
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Review Your Request</h3>
+          <p class="muted">Please confirm the items and quantities before submitting.</p>
+          <div class="row">
+            <div>
+              <p><b>Name:</b> {{ name }}</p>
+              <p><b>Phone:</b> {{ phone }}</p>
+              <p><b>Email:</b> {{ email }}</p>
+              {% if note %}<p><b>Notes:</b> {{ note }}</p>{% endif %}
+            </div>
+          </div>
+          <table>
+            <tr><th>Item</th><th>Unit</th><th>Qty</th></tr>
+            {% for it in selected %}
+              <tr>
+                <td>
+                  {% if it["image_url"] %}
+                    <img src="{{ it['image_url'] }}" alt="{{ it['item_name'] }}" style="max-width:120px; max-height:120px; display:block; margin-bottom:8px;" />
+                  {% endif %}
+                  {{ it["item_name"] }}
+                </td>
+                <td>{{ it["unit"] }}</td>
+                <td>{{ '%.2f'|format(it["qty"]) }}</td>
+              </tr>
+            {% endfor %}
+          </table>
+          <form method="POST" action="{{ url_for('member_request_submit') }}">
+            <input type="hidden" name="name" value="{{ name }}" />
+            <input type="hidden" name="phone" value="{{ phone }}" />
+            <input type="hidden" name="email" value="{{ email }}" />
+            <input type="hidden" name="note" value="{{ note }}" />
+            {% for it in selected %}
+              <input type="hidden" name="qty_{{ it['item_id'] }}" value="{{ it['qty'] }}" />
+            {% endfor %}
+            <p style="margin-top:12px;">
+              <button class="btn btn-primary" type="submit">Confirm and Submit</button>
+              <a class="btn" href="/member/request">Edit</a>
+            </p>
+          </form>
+        </div>
+        """,
+        name=name,
+        phone=phone,
+        email=email,
+        note=note,
+        selected=selected,
+    )
+    return render_template_string(BASE, body=body)
+
+
+@APP.post("/member/request/submit")
 def member_request_submit():
     name = (request.form.get("name") or "").strip()
     phone = (request.form.get("phone") or "").strip()
@@ -597,18 +1046,32 @@ def member_request_submit():
 
     c = conn()
     try:
-        # Create member
-        c.execute("INSERT INTO members (name, phone, email) VALUES (?, ?, ?)", (name, phone, email))
-        member_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # Reuse member if email or phone already exists
+        member_row = c.execute(
+            "SELECT member_id FROM members WHERE email=? OR phone=? ORDER BY created_at DESC LIMIT 1",
+            (email, phone),
+        ).fetchone()
+        if member_row:
+            member_id = member_row["member_id"]
+            c.execute(
+                "UPDATE members SET name=?, phone=?, email=? WHERE member_id=?",
+                (name, phone, email, member_id),
+            )
+        else:
+            c.execute("INSERT INTO members (name, phone, email) VALUES (?, ?, ?)", (name, phone, email))
+            member_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         # Create request
         c.execute("INSERT INTO requests (member_id, status, note) VALUES (?, 'PENDING', ?)", (member_id, note))
         request_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         # Pull available items
-        items = c.execute("SELECT item_id FROM items WHERE is_active=1").fetchall()
+        items = c.execute(
+            "SELECT item_id, item_name, unit FROM items WHERE is_active=1 AND COALESCE(qty_available, 0) > 0"
+        ).fetchall()
 
         added = 0
+        selected_items = []
         for it in items:
             item_id = it["item_id"]
             qty = float(request.form.get(f"qty_{item_id}") or 0)
@@ -617,6 +1080,7 @@ def member_request_submit():
                     "INSERT INTO request_items (request_id, item_id, qty_requested) VALUES (?, ?, ?)",
                     (request_id, item_id, qty),
                 )
+                selected_items.append({"item_name": it["item_name"], "unit": it["unit"], "qty": qty})
                 added += 1
 
         if added == 0:
@@ -637,13 +1101,32 @@ def member_request_submit():
     except Exception as exc:
         print(f"⚠️ Email notification failed: {exc}")
 
-    body = """
-    <div class="card">
-      <p class="ok"><b>Request submitted!</b></p>
-      <p>Please wait for approval from the pantry manager.</p>
-      <p><a href="/member/request">Submit another request</a></p>
-    </div>
-    """
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Request Submitted</h3>
+          <p class="ok"><b>Thank you! Your request has been received.</b></p>
+          <p><b>Request ID:</b> {{ request_id }}</p>
+          <p>Please wait for approval from the pantry manager.</p>
+          <table>
+            <tr><th>Item</th><th>Unit</th><th>Qty</th></tr>
+            {% for it in selected_items %}
+              <tr>
+                <td>{{ it["item_name"] }}</td>
+                <td>{{ it["unit"] }}</td>
+                <td>{{ '%.2f'|format(it["qty"]) }}</td>
+              </tr>
+            {% endfor %}
+          </table>
+          <p style="margin-top:12px;">
+            <button class="btn" onclick="window.print()">Print Confirmation</button>
+            <a class="btn btn-primary" href="/member/request">Submit another request</a>
+          </p>
+        </div>
+        """,
+        request_id=request_id,
+        selected_items=selected_items,
+    )
     return render_template_string(BASE, body=body)
 
 
@@ -711,6 +1194,9 @@ def manager_stock():
                 <label>Initial Quantity (optional)</label>
                 <input type="number" step="1" min="0" name="initial_qty" value="0" />
 
+                <label>Unit Cost (optional)</label>
+                <input type="number" step="0.01" min="0" name="unit_cost" value="" placeholder="e.g., 2.50" />
+
                 <p style="margin-top:12px;">
                   <button class="btn btn-primary" type="submit">Add Item</button>
                 </p>
@@ -732,6 +1218,9 @@ def manager_stock():
 
                 <label>Set Expiry Date (optional)</label>
                 <input type="date" name="expiry_date_update" />
+
+                <label>Set Unit Cost (optional)</label>
+                <input type="number" step="0.01" min="0" name="unit_cost_update" value="" />
 
                 <label>Set Active?</label>
                 <select name="is_active">
@@ -811,6 +1300,8 @@ def manager_add_item():
     item_name = (request.form.get("item_name") or "").strip()
     unit = (request.form.get("unit") or "").strip()
     expiry_date = (request.form.get("expiry_date") or "").strip() or None
+    unit_cost = request.form.get("unit_cost")
+    unit_cost_val = float(unit_cost) if unit_cost not in (None, "") else None
     image_url = None
     image_file = request.files.get("image_file")
     if image_file and image_file.filename:
@@ -826,15 +1317,15 @@ def manager_add_item():
     c = conn()
     try:
         c.execute(
-            "INSERT INTO items (item_name, unit, expiry_date, image_url, qty_available, is_active) VALUES (?, ?, ?, ?, ?, 1)",
-            (item_name, unit, expiry_date, image_url, max(0, initial_qty)),
+            "INSERT INTO items (item_name, unit, expiry_date, image_url, qty_available, unit_cost, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)",
+            (item_name, unit, expiry_date, image_url, max(0, initial_qty), unit_cost_val),
         )
         item_id = c.execute("SELECT item_id FROM items WHERE item_name=?", (item_name,)).fetchone()["item_id"]
 
         if initial_qty > 0:
             c.execute(
-                "INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by) VALUES (?, 'IN', ?, 'Initial stock', 'manager')",
-                (item_id, initial_qty),
+                "INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by) VALUES (?, 'IN', ?, 'Initial stock', ?)",
+                (item_id, initial_qty, current_manager_name()),
             )
         c.commit()
     finally:
@@ -849,14 +1340,16 @@ def manager_update_item():
     item_id = int(request.form.get("item_id"))
     add_qty = float(request.form.get("add_qty") or 0)
     expiry_update = (request.form.get("expiry_date_update") or "").strip() or None
+    unit_cost_update = request.form.get("unit_cost_update")
+    unit_cost_val = float(unit_cost_update) if unit_cost_update not in (None, "") else None
     is_active = int(request.form.get("is_active") or 1)
 
     c = conn()
     try:
         if add_qty > 0:
             c.execute(
-                "INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by) VALUES (?, 'IN', ?, 'Intake', 'manager')",
-                (item_id, add_qty),
+                "INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by) VALUES (?, 'IN', ?, 'Intake', ?)",
+                (item_id, add_qty, current_manager_name()),
             )
             c.execute(
                 "UPDATE items SET qty_available = qty_available + ? WHERE item_id=?",
@@ -865,6 +1358,9 @@ def manager_update_item():
 
         if expiry_update:
             c.execute("UPDATE items SET expiry_date=? WHERE item_id=?", (expiry_update, item_id))
+
+        if unit_cost_val is not None:
+            c.execute("UPDATE items SET unit_cost=? WHERE item_id=?", (unit_cost_val, item_id))
 
         c.execute("UPDATE items SET is_active=? WHERE item_id=?", (is_active, item_id))
 
@@ -881,6 +1377,16 @@ def manager_requests():
     q = (request.args.get("q") or "").strip()
     sort = (request.args.get("sort") or "id").strip()
     direction = (request.args.get("dir") or "desc").strip().lower()
+    status_filter = (request.args.get("status") or "all").strip().upper()
+    urgent_only = (request.args.get("urgent") or "0").strip() == "1"
+    try:
+        low_threshold = int(request.args.get("low", "5"))
+    except ValueError:
+        low_threshold = 5
+    try:
+        exp_days = int(request.args.get("exp", "30"))
+    except ValueError:
+        exp_days = 30
     sort_map = {
         "id": "r.request_id",
         "status": "r.status",
@@ -900,10 +1406,13 @@ def manager_requests():
             )
             like = f"%{q}%"
             params.extend([like, like, like, like])
+        if status_filter in ("PENDING", "APPROVED", "REJECTED"):
+            where_clause = f"{where_clause} {'AND' if where_clause else 'WHERE'} r.status=?"
+            params.append(status_filter)
 
         reqs = c.execute(
             f"""
-            SELECT r.request_id, r.status, r.note, r.created_at,
+            SELECT r.request_id, r.status, r.note, r.reject_reason, r.created_at,
                    m.name, m.phone, m.email
             FROM requests r
             JOIN members m ON m.member_id = r.member_id
@@ -925,6 +1434,26 @@ def manager_requests():
                 (r["request_id"],),
             ).fetchall()
             items_by_req[r["request_id"]] = rows
+
+        urgent_rows = c.execute(
+            """
+            SELECT DISTINCT r.request_id
+            FROM requests r
+            JOIN request_items ri ON ri.request_id = r.request_id
+            JOIN items i ON i.item_id = ri.item_id
+            WHERE r.status='PENDING'
+              AND (
+                i.is_active != 1
+                OR ri.qty_requested > COALESCE(i.qty_available, 0)
+                OR (i.expiry_date IS NOT NULL AND date(i.expiry_date) <= date('now', ?))
+                OR (COALESCE(i.qty_available, 0) > 0 AND COALESCE(i.qty_available, 0) <= ?)
+              )
+            """,
+            (f"+{exp_days} day", low_threshold),
+        ).fetchall()
+        urgent_ids = {r["request_id"] for r in urgent_rows}
+        if urgent_only:
+            reqs = [r for r in reqs if r["request_id"] in urgent_ids]
     finally:
         c.close()
 
@@ -953,21 +1482,66 @@ def manager_requests():
                   <option value="asc" {% if direction == "asc" %}selected{% endif %}>Ascending</option>
                 </select>
               </div>
+              <div>
+                <label>Status</label>
+                <select name="status">
+                  <option value="all" {% if status_filter == "ALL" %}selected{% endif %}>All</option>
+                  <option value="PENDING" {% if status_filter == "PENDING" %}selected{% endif %}>Pending</option>
+                  <option value="APPROVED" {% if status_filter == "APPROVED" %}selected{% endif %}>Approved</option>
+                  <option value="REJECTED" {% if status_filter == "REJECTED" %}selected{% endif %}>Rejected</option>
+                </select>
+              </div>
+              <div>
+                <label>Urgent only</label>
+                <select name="urgent">
+                  <option value="0" {% if not urgent_only %}selected{% endif %}>No</option>
+                  <option value="1" {% if urgent_only %}selected{% endif %}>Yes</option>
+                </select>
+              </div>
               <div style="align-self:flex-end;">
                 <button class="btn btn-primary" type="submit">Apply</button>
               </div>
               <div style="align-self:flex-end;">
-                <a class="btn" href="/manager/requests.csv?q={{ q }}&sort={{ sort }}&dir={{ direction }}">Export CSV</a>
+                <a class="btn" href="/manager/requests.csv?q={{ q }}&sort={{ sort }}&dir={{ direction }}&status={{ status_filter }}&urgent={{ 1 if urgent_only else 0 }}">Export CSV</a>
               </div>
             </div>
           </form>
+          <form id="bulk-form" method="POST" action="{{ url_for('manager_requests_bulk') }}">
+            <input type="hidden" name="q" value="{{ q }}" />
+            <input type="hidden" name="sort" value="{{ sort }}" />
+            <input type="hidden" name="dir" value="{{ direction }}" />
+            <input type="hidden" name="status" value="{{ status_filter }}" />
+            <input type="hidden" name="urgent" value="{{ 1 if urgent_only else 0 }}" />
+            <div class="row" style="margin-top:10px;">
+              <div>
+                <label>Bulk action</label>
+                <select name="bulk_action">
+                  <option value="APPROVE">Approve selected</option>
+                  <option value="REJECT">Reject selected</option>
+                </select>
+              </div>
+              <div style="flex:2;">
+                <label>Reject reason (if rejecting)</label>
+                <input name="reject_reason" placeholder="Optional reason for rejection" />
+              </div>
+              <div style="align-self:flex-end;">
+                <button class="btn btn-primary" type="submit">Apply to Selected</button>
+              </div>
+            </div>
           {% if reqs|length == 0 %}
             <p class="muted">No requests yet.</p>
           {% endif %}
+          </form>
 
           {% for r in reqs %}
             <div class="card">
-              <div><b>Request #{{ r["request_id"] }}</b> — <b>{{ r["status"] }}</b></div>
+              <div>
+                <input type="checkbox" name="request_id" value="{{ r['request_id'] }}" form="bulk-form" />
+                <b>Request #{{ r["request_id"] }}</b> — <b>{{ r["status"] }}</b>
+                {% if r["request_id"] in urgent_ids %}
+                  <span class="badge badge-alert">Urgent</span>
+                {% endif %}
+              </div>
               <div class="muted">Created: {{ r["created_at"] }}</div>
               <div style="margin-top:8px;">
                 <b>Member:</b> {{ r["name"] }} |
@@ -976,6 +1550,9 @@ def manager_requests():
               </div>
               {% if r["note"] %}
                 <div class="muted" style="margin-top:8px;"><b>Note:</b> {{ r["note"] }}</div>
+              {% endif %}
+              {% if r["reject_reason"] %}
+                <div class="danger" style="margin-top:8px;"><b>Rejection Reason:</b> {{ r["reject_reason"] }}</div>
               {% endif %}
 
               <table>
@@ -991,6 +1568,7 @@ def manager_requests():
               {% if r["status"] == "PENDING" %}
                 <form method="POST" action="{{ url_for('manager_decide_request') }}" style="margin-top:10px;">
                   <input type="hidden" name="request_id" value="{{ r['request_id'] }}" />
+                  <input type="text" name="reject_reason" placeholder="Optional rejection reason" />
                   <button class="btn btn-primary" name="decision" value="APPROVE" type="submit">Approve</button>
                   <button class="btn" name="decision" value="REJECT" type="submit">Reject</button>
                 </form>
@@ -1004,6 +1582,9 @@ def manager_requests():
         q=q,
         sort=sort,
         direction=direction,
+        status_filter=status_filter,
+        urgent_only=urgent_only,
+        urgent_ids=urgent_ids,
     )
     return render_template_string(BASE, body=body)
 
@@ -1014,6 +1595,16 @@ def manager_requests_csv():
     q = (request.args.get("q") or "").strip()
     sort = (request.args.get("sort") or "id").strip()
     direction = (request.args.get("dir") or "desc").strip().lower()
+    status_filter = (request.args.get("status") or "all").strip().upper()
+    urgent_only = (request.args.get("urgent") or "0").strip() == "1"
+    try:
+        low_threshold = int(request.args.get("low", "5"))
+    except ValueError:
+        low_threshold = 5
+    try:
+        exp_days = int(request.args.get("exp", "30"))
+    except ValueError:
+        exp_days = 30
     sort_map = {
         "id": "r.request_id",
         "status": "r.status",
@@ -1033,10 +1624,13 @@ def manager_requests_csv():
             )
             like = f"%{q}%"
             params.extend([like, like, like, like])
+        if status_filter in ("PENDING", "APPROVED", "REJECTED"):
+            where_clause = f"{where_clause} {'AND' if where_clause else 'WHERE'} r.status=?"
+            params.append(status_filter)
 
         reqs = c.execute(
             f"""
-            SELECT r.request_id, r.status, r.note, r.created_at,
+            SELECT r.request_id, r.status, r.note, r.reject_reason, r.created_at,
                    m.name, m.phone, m.email
             FROM requests r
             JOIN members m ON m.member_id = r.member_id
@@ -1045,6 +1639,26 @@ def manager_requests_csv():
             """,
             params,
         ).fetchall()
+
+        if urgent_only:
+            urgent_rows = c.execute(
+                """
+                SELECT DISTINCT r.request_id
+                FROM requests r
+                JOIN request_items ri ON ri.request_id = r.request_id
+                JOIN items i ON i.item_id = ri.item_id
+                WHERE r.status='PENDING'
+                  AND (
+                    i.is_active != 1
+                    OR ri.qty_requested > COALESCE(i.qty_available, 0)
+                    OR (i.expiry_date IS NOT NULL AND date(i.expiry_date) <= date('now', ?))
+                    OR (COALESCE(i.qty_available, 0) > 0 AND COALESCE(i.qty_available, 0) <= ?)
+                  )
+                """,
+                (f"+{exp_days} day", low_threshold),
+            ).fetchall()
+            urgent_ids = {r["request_id"] for r in urgent_rows}
+            reqs = [r for r in reqs if r["request_id"] in urgent_ids]
 
         rows = [
             [
@@ -1055,6 +1669,7 @@ def manager_requests_csv():
                 "phone",
                 "email",
                 "note",
+                "reject_reason",
                 "items",
             ]
         ]
@@ -1080,6 +1695,7 @@ def manager_requests_csv():
                     r["phone"],
                     r["email"],
                     r["note"] or "",
+                    r["reject_reason"] or "",
                     item_text,
                 ]
             )
@@ -1087,6 +1703,129 @@ def manager_requests_csv():
         c.close()
 
     return csv_response("requests.csv", rows)
+
+
+@APP.post("/manager/requests/bulk")
+@requires_manager_auth
+def manager_requests_bulk():
+    request_ids = [int(rid) for rid in request.form.getlist("request_id") if rid.isdigit()]
+    action = (request.form.get("bulk_action") or "").strip().upper()
+    reject_reason = (request.form.get("reject_reason") or "").strip()
+
+    if not request_ids:
+        body = '<div class="card"><p class="muted">No requests selected.</p><p><a href="/manager/requests">Back to requests</a></p></div>'
+        return render_template_string(BASE, body=body)
+
+    if action not in ("APPROVE", "REJECT"):
+        abort(400, "Invalid bulk action")
+
+    results = {"approved": [], "rejected": [], "skipped": [], "failed": []}
+    c = conn()
+    try:
+        for req_id in request_ids:
+            r = c.execute(
+                """
+                SELECT r.status, r.member_id, m.name, m.email
+                FROM requests r
+                JOIN members m ON m.member_id = r.member_id
+                WHERE r.request_id=?
+                """,
+                (req_id,),
+            ).fetchone()
+            if not r:
+                results["skipped"].append((req_id, "Not found"))
+                continue
+            if r["status"] != "PENDING":
+                results["skipped"].append((req_id, f"Already {r['status']}"))
+                continue
+
+            if action == "REJECT":
+                c.execute(
+                    "UPDATE requests SET status='REJECTED', reject_reason=?, decided_at=?, decided_by=? WHERE request_id=?",
+                    (reject_reason, datetime.utcnow().isoformat(), current_manager_name(), req_id),
+                )
+                results["rejected"].append(req_id)
+                try:
+                    notify_request_rejected(req_id, r["email"], r["name"], reject_reason)
+                except Exception as exc:
+                    print(f"⚠️ Reject email failed: {exc}")
+                continue
+
+            # APPROVE
+            rows = c.execute(
+                """
+                SELECT ri.item_id, ri.qty_requested, i.qty_available, i.item_name, i.is_active
+                FROM request_items ri
+                JOIN items i ON i.item_id = ri.item_id
+                WHERE ri.request_id = ?
+                """,
+                (req_id,),
+            ).fetchall()
+
+            blocked = []
+            for row in rows:
+                if row["is_active"] != 1:
+                    blocked.append(f"{row['item_name']} inactive")
+                elif row["qty_requested"] > (row["qty_available"] or 0):
+                    blocked.append(f"{row['item_name']} insufficient stock")
+            if blocked:
+                results["failed"].append((req_id, "; ".join(blocked)))
+                continue
+
+            for row in rows:
+                c.execute(
+                    "UPDATE items SET qty_available = qty_available - ? WHERE item_id=?",
+                    (row["qty_requested"], row["item_id"]),
+                )
+                c.execute(
+                    "INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by) VALUES (?, 'OUT', ?, ?, ?)",
+                    (row["item_id"], row["qty_requested"], f"Approved request #{req_id}", current_manager_name()),
+                )
+
+            c.execute(
+                "UPDATE requests SET status='APPROVED', decided_at=?, decided_by=? WHERE request_id=?",
+                (datetime.utcnow().isoformat(), current_manager_name(), req_id),
+            )
+            results["approved"].append(req_id)
+
+        c.commit()
+    finally:
+        c.close()
+
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Bulk Action Results</h3>
+          <p><b>Approved:</b> {{ results["approved"]|length }}</p>
+          <p><b>Rejected:</b> {{ results["rejected"]|length }}</p>
+          <p><b>Skipped:</b> {{ results["skipped"]|length }}</p>
+          <p><b>Failed:</b> {{ results["failed"]|length }}</p>
+          {% if results["failed"] %}
+            <div class="card">
+              <h4>Failures</h4>
+              <ul>
+                {% for rid, reason in results["failed"] %}
+                  <li>Request #{{ rid }}: {{ reason }}</li>
+                {% endfor %}
+              </ul>
+            </div>
+          {% endif %}
+          {% if results["skipped"] %}
+            <div class="card">
+              <h4>Skipped</h4>
+              <ul>
+                {% for rid, reason in results["skipped"] %}
+                  <li>Request #{{ rid }}: {{ reason }}</li>
+                {% endfor %}
+              </ul>
+            </div>
+          {% endif %}
+          <p><a href="/manager/requests">Back to requests</a></p>
+        </div>
+        """,
+        results=results,
+    )
+    return render_template_string(BASE, body=body)
 
 
 @APP.get("/manager/reports")
@@ -1116,6 +1855,9 @@ def manager_reports():
         total_qty = c.execute(
             "SELECT COALESCE(SUM(qty_available), 0) AS total_qty FROM items"
         ).fetchone()["total_qty"]
+        inventory_value = c.execute(
+            "SELECT COALESCE(SUM(COALESCE(qty_available, 0) * COALESCE(unit_cost, 0)), 0) AS total_value FROM items"
+        ).fetchone()["total_value"]
 
         low_stock = c.execute(
             """
@@ -1169,6 +1911,94 @@ def manager_reports():
             LIMIT 10
             """
         ).fetchall()
+
+        top_items_by_members = c.execute(
+            """
+            SELECT i.item_name, i.unit, COUNT(DISTINCT r.member_id) AS member_count
+            FROM request_items ri
+            JOIN requests r ON r.request_id = ri.request_id
+            JOIN items i ON i.item_id = ri.item_id
+            GROUP BY i.item_id
+            ORDER BY member_count DESC
+            LIMIT 10
+            """
+        ).fetchall()
+
+        rejected_summary = c.execute(
+            """
+            SELECT i.item_name, i.unit, COUNT(*) AS rejected_count
+            FROM request_items ri
+            JOIN requests r ON r.request_id = ri.request_id
+            JOIN items i ON i.item_id = ri.item_id
+            WHERE r.status='REJECTED'
+            GROUP BY i.item_id
+            ORDER BY rejected_count DESC
+            LIMIT 10
+            """
+        ).fetchall()
+
+        idle_items = c.execute(
+            """
+            SELECT i.item_name, i.unit, i.qty_available
+            FROM items i
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM request_items ri
+                JOIN requests r ON r.request_id = ri.request_id
+                WHERE ri.item_id = i.item_id
+                  AND date(r.created_at) >= date('now', '-90 day')
+            )
+            ORDER BY i.item_name
+            """
+        ).fetchall()
+
+        movement_by_month = c.execute(
+            """
+            SELECT strftime('%Y-%m', created_at) AS ym, movement_type, COALESCE(SUM(qty), 0) AS total_qty
+            FROM stock_movements
+            WHERE date(created_at) >= date('now', '-180 day')
+            GROUP BY ym, movement_type
+            """
+        ).fetchall()
+        movement_map = {}
+        for row in movement_by_month:
+            movement_map.setdefault(row["ym"], {})[row["movement_type"]] = row["total_qty"]
+
+        month_labels = []
+        today = datetime.utcnow().date()
+        month = today.month
+        year = today.year
+        for _ in range(6):
+            month_labels.append(f"{year:04d}-{month:02d}")
+            month -= 1
+            if month == 0:
+                month = 12
+                year -= 1
+        month_labels = list(reversed(month_labels))
+        monthly_trend = []
+        for ym in month_labels:
+            data = movement_map.get(ym, {})
+            monthly_trend.append(
+                {"label": ym, "in_qty": data.get("IN", 0), "out_qty": data.get("OUT", 0)}
+            )
+
+        weekly_rows = c.execute(
+            """
+            SELECT strftime('%Y-%W', created_at) AS yw, COUNT(*) AS cnt
+            FROM requests
+            WHERE date(created_at) >= date('now', '-56 day')
+            GROUP BY yw
+            """
+        ).fetchall()
+        weekly_map = {row["yw"]: row["cnt"] for row in weekly_rows}
+        weekly_trend = []
+        week_start = today - timedelta(days=today.weekday())
+        for i in range(7, -1, -1):
+            start = week_start - timedelta(weeks=i)
+            key = start.strftime("%Y-%W")
+            label = start.strftime("%b %d")
+            weekly_trend.append({"label": label, "count": weekly_map.get(key, 0)})
+        max_week_count = max([w["count"] for w in weekly_trend], default=0)
 
         movement_rows = c.execute(
             """
@@ -1225,6 +2055,10 @@ def manager_reports():
               <div class="stat-label">Requests (30 days)</div>
               <div class="stat-value">{{ recent_requests }}</div>
             </div>
+            <div class="stat-card">
+              <div class="stat-label">Inventory Value</div>
+              <div class="stat-value">${{ '%.2f'|format(inventory_value) }}</div>
+            </div>
           </div>
         </div>
 
@@ -1237,7 +2071,35 @@ def manager_reports():
             <tr><th>In Stock Items</th><td>{{ in_stock_items }}</td></tr>
             <tr><th>Out of Stock Items</th><td>{{ out_stock_items }}</td></tr>
             <tr><th>Total Quantity (all items)</th><td>{{ '%.2f'|format(total_qty) }}</td></tr>
+            <tr><th>Estimated Inventory Value</th><td>${{ '%.2f'|format(inventory_value) }}</td></tr>
           </table>
+        </div>
+
+        <div class="card">
+          <h4>Monthly Intake vs Distribution (Last 6 Months)</h4>
+          {% for m in monthly_trend %}
+            {% set max_val = [m.in_qty, m.out_qty]|max %}
+            <div class="bar-row">
+              <div class="bar-label">{{ m.label }}</div>
+              <div class="bar-track">
+                <div class="bar" style="width: {{ (m.in_qty / (max_val if max_val else 1)) * 100 }}%;"></div>
+              </div>
+              <div class="muted">IN {{ '%.2f'|format(m.in_qty) }} / OUT {{ '%.2f'|format(m.out_qty) }}</div>
+            </div>
+          {% endfor %}
+        </div>
+
+        <div class="card">
+          <h4>Weekly Requests (Last 8 Weeks)</h4>
+          {% for w in weekly_trend %}
+            <div class="bar-row">
+              <div class="bar-label">{{ w.label }}</div>
+              <div class="bar-track">
+                <div class="bar" style="width: {{ (w.count / (max_week_count if max_week_count else 1)) * 100 }}%;"></div>
+              </div>
+              <div class="muted">{{ w.count }} requests</div>
+            </div>
+          {% endfor %}
         </div>
 
         <div class="card">
@@ -1335,6 +2197,68 @@ def manager_reports():
         </div>
 
         <div class="card">
+          <h4>Top Requested Items (By Member Count)</h4>
+          <table>
+            <tr><th>Item</th><th>Unit</th><th>Members</th></tr>
+            {% if top_items_by_members|length == 0 %}
+              <tr><td colspan="3" class="muted">No requests yet.</td></tr>
+            {% else %}
+              {% for it in top_items_by_members %}
+                <tr>
+                  <td>{{ it["item_name"] }}</td>
+                  <td>{{ it["unit"] }}</td>
+                  <td>{{ it["member_count"] }}</td>
+                </tr>
+              {% endfor %}
+            {% endif %}
+          </table>
+        </div>
+
+        <div class="card">
+          <h4>Rejected Requests Summary (Top Items)</h4>
+          <table>
+            <tr><th>Item</th><th>Unit</th><th>Rejected Count</th></tr>
+            {% if rejected_summary|length == 0 %}
+              <tr><td colspan="3" class="muted">No rejected requests.</td></tr>
+            {% else %}
+              {% for it in rejected_summary %}
+                <tr>
+                  <td>{{ it["item_name"] }}</td>
+                  <td>{{ it["unit"] }}</td>
+                  <td>{{ it["rejected_count"] }}</td>
+                </tr>
+              {% endfor %}
+            {% endif %}
+          </table>
+        </div>
+
+        <div class="card">
+          <h4>Items with No Requests in 90 Days</h4>
+          <table>
+            <tr><th>Item</th><th>Unit</th><th>Qty</th></tr>
+            {% if idle_items|length == 0 %}
+              <tr><td colspan="3" class="muted">No idle items found.</td></tr>
+            {% else %}
+              {% for it in idle_items %}
+                <tr>
+                  <td>{{ it["item_name"] }}</td>
+                  <td>{{ it["unit"] }}</td>
+                  <td>{{ '%.2f'|format(it["qty_available"]) }}</td>
+                </tr>
+              {% endfor %}
+            {% endif %}
+          </table>
+        </div>
+
+        <div class="card">
+          <h4>Exports</h4>
+          <p>
+            <a class="btn" href="/manager/items.csv">Export Items CSV</a>
+            <a class="btn" href="/manager/requests.csv">Export Requests CSV</a>
+          </p>
+        </div>
+
+        <div class="card">
           <h4>Stock Movements (Last 30 Days)</h4>
           <table>
             <tr><th>Type</th><th>Total Qty</th></tr>
@@ -1358,6 +2282,13 @@ def manager_reports():
         recent_requests=recent_requests,
         gaps=gaps,
         top_items=top_items,
+        top_items_by_members=top_items_by_members,
+        rejected_summary=rejected_summary,
+        idle_items=idle_items,
+        monthly_trend=monthly_trend,
+        weekly_trend=weekly_trend,
+        max_week_count=max_week_count,
+        inventory_value=inventory_value,
         movement_totals=movement_totals,
     )
     return render_template_string(BASE, body=body)
@@ -1438,6 +2369,7 @@ def build_stock_flags(expiry_date: str | None, qty_available: float, is_active: 
 def manager_decide_request():
     req_id = int(request.form.get("request_id"))
     decision = request.form.get("decision")
+    reject_reason = (request.form.get("reject_reason") or "").strip()
 
     if decision not in ("APPROVE", "REJECT"):
         abort(400, "Invalid decision")
@@ -1452,10 +2384,24 @@ def manager_decide_request():
 
         if decision == "REJECT":
             c.execute(
-                "UPDATE requests SET status='REJECTED', decided_at=?, decided_by='manager' WHERE request_id=?",
-                (datetime.utcnow().isoformat(), req_id),
+                "UPDATE requests SET status='REJECTED', reject_reason=?, decided_at=?, decided_by=? WHERE request_id=?",
+                (reject_reason, datetime.utcnow().isoformat(), current_manager_name(), req_id),
             )
             c.commit()
+            try:
+                member = c.execute(
+                    """
+                    SELECT m.email, m.name
+                    FROM requests r
+                    JOIN members m ON m.member_id = r.member_id
+                    WHERE r.request_id=?
+                    """,
+                    (req_id,),
+                ).fetchone()
+                if member:
+                    notify_request_rejected(req_id, member["email"], member["name"], reject_reason)
+            except Exception as exc:
+                print(f"⚠️ Reject email failed: {exc}")
             return redirect(url_for("manager_requests"))
 
         # APPROVE: check stock and deduct
@@ -1489,13 +2435,13 @@ def manager_decide_request():
                 (row["qty_requested"], row["item_id"]),
             )
             c.execute(
-                "INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by) VALUES (?, 'OUT', ?, ?, 'manager')",
-                (row["item_id"], row["qty_requested"], f"Approved request #{req_id}"),
+                "INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by) VALUES (?, 'OUT', ?, ?, ?)",
+                (row["item_id"], row["qty_requested"], f"Approved request #{req_id}", current_manager_name()),
             )
 
         c.execute(
-            "UPDATE requests SET status='APPROVED', decided_at=?, decided_by='manager' WHERE request_id=?",
-            (datetime.utcnow().isoformat(), req_id),
+            "UPDATE requests SET status='APPROVED', decided_at=?, decided_by=? WHERE request_id=?",
+            (datetime.utcnow().isoformat(), current_manager_name(), req_id),
         )
 
         c.commit()
@@ -1695,6 +2641,37 @@ def manager_stock_view_csv():
         )
 
     return csv_response("stock_view.csv", rows)
+
+
+@APP.get("/manager/items.csv")
+@requires_manager_auth
+def manager_items_csv():
+    c = conn()
+    try:
+        items = c.execute(
+            """
+            SELECT item_name, unit, qty_available, unit_cost, expiry_date, is_active
+            FROM items
+            ORDER BY item_name
+            """
+        ).fetchall()
+    finally:
+        c.close()
+
+    rows = [["item_name", "unit", "qty_available", "unit_cost", "expiry_date", "status"]]
+    for it in items:
+        rows.append(
+            [
+                it["item_name"],
+                it["unit"],
+                it["qty_available"],
+                it["unit_cost"] if it["unit_cost"] is not None else "",
+                it["expiry_date"] or "",
+                "Active" if it["is_active"] == 1 else "Inactive",
+            ]
+        )
+
+    return csv_response("items.csv", rows)
 
 
 @APP.route("/manager/review/<int:req_id>")
