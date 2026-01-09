@@ -1,3 +1,5 @@
+import csv
+import io
 import os
 import sqlite3
 from datetime import datetime
@@ -77,6 +79,16 @@ def send_email(to_email: str, subject: str, body: str):
         s.login(user, password)
         s.send_message(msg)
 
+
+def csv_response(filename: str, rows: list[list[str]]) -> Response:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    for row in rows:
+        writer.writerow(row)
+    resp = Response(output.getvalue(), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    return resp
+
 def notify_manager_new_request(req_id: int, member_name: str, phone: str, email: str):
     manager_email = os.environ.get("MANAGER_EMAIL")
     if not manager_email:
@@ -110,6 +122,9 @@ def acknowledge_requester(req_id: int, requester_email: str, member_name: str):
 DB = os.environ.get("PANTRY_DB_PATH", os.path.join("/tmp", "church_pantry.db"))
 
 MANAGER_PASSWORD = os.environ.get("PANTRY_MANAGER_PASSWORD", "ChangeMe123!")
+CHURCH_NAME = os.environ.get("PANTRY_CHURCH_NAME", "The Church of Pentecost - Kansas District")
+CHURCH_TAGLINE = os.environ.get("PANTRY_CHURCH_TAGLINE", "Serving families with dignity and care")
+LOGO_URL = os.environ.get("PANTRY_LOGO_URL", "/static/church_logo.jpeg")
 
 _DB_READY = False
 
@@ -236,53 +251,196 @@ def requires_manager_auth(func):
 
 @APP.context_processor
 def inject_manager_auth():
-    return {"is_manager": is_manager_logged_in()}
+    return {
+        "is_manager": is_manager_logged_in(),
+        "church_name": CHURCH_NAME,
+        "church_tagline": CHURCH_TAGLINE,
+        "logo_url": LOGO_URL,
+    }
 
 
 # ============================================================
-# UI Templates (simple / no graphics)
+# UI Templates
 # ============================================================
 BASE = """
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Church Pantry</title>
+  <title>{{ church_name }}</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 24px; max-width: 980px; }
-    a { text-decoration: none; }
-    .nav { margin-bottom: 14px; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 14px; margin: 14px 0; }
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,700&display=swap');
+    :root {
+      --ink: #0e1320;
+      --muted: #5e6573;
+      --brand: #0b2c5f;
+      --accent: #d4a017;
+      --surface: #ffffff;
+      --soft: #f2f4f8;
+      --line: #dde3ef;
+      --shadow: 0 12px 28px rgba(10, 22, 52, 0.18);
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Space Grotesk", "Helvetica Neue", Arial, sans-serif;
+      color: var(--ink);
+      margin: 0;
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #efe4ff 0%, rgba(239,228,255,0) 58%),
+        radial-gradient(900px 500px at 90% 0%, #e4f0ff 0%, rgba(228,240,255,0) 55%),
+        linear-gradient(180deg, #fbfcff 0%, #f3f6fb 100%);
+    }
+    a { text-decoration: none; color: inherit; }
+    .page { max-width: 1100px; margin: 0 auto; padding: 28px 20px 48px; }
+    .site-header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 20px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(120deg, rgba(255,255,255,0.96) 0%, rgba(246,248,253,0.96) 100%);
+      box-shadow: var(--shadow);
+      margin-bottom: 22px;
+      position: sticky;
+      top: 16px;
+      backdrop-filter: blur(6px);
+      z-index: 5;
+    }
+    .brand-title {
+      font-family: "Source Serif 4", "Times New Roman", serif;
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: 0.4px;
+    }
+    .brand-subtitle { color: var(--muted); font-size: 14px; }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-logo {
+      width: 54px;
+      height: 54px;
+      border-radius: 50%;
+      border: 2px solid var(--accent);
+      background: #fff;
+      padding: 4px;
+      object-fit: cover;
+      box-shadow: 0 8px 18px rgba(10, 22, 52, 0.2);
+    }
+    .nav { display: flex; flex-wrap: wrap; gap: 10px; }
+    .nav a {
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: var(--soft);
+      border: 1px solid transparent;
+      transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+      font-size: 14px;
+    }
+    .nav a:hover { transform: translateY(-1px); border-color: var(--line); background: #ffffff; }
+    .content { display: block; }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 18px;
+      margin: 16px 0;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      animation: rise 0.45s ease both;
+    }
     .row { display: flex; gap: 12px; flex-wrap: wrap; }
     .row > div { flex: 1; min-width: 240px; }
-    label { display: block; font-weight: bold; margin-top: 10px; }
-    input, select, textarea { width: 100%; padding: 8px; margin-top: 6px; }
+    label { display: block; font-weight: 600; margin-top: 10px; }
+    input, select, textarea {
+      width: 100%;
+      padding: 10px 12px;
+      margin-top: 6px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #fff;
+      font-family: inherit;
+    }
     table { border-collapse: collapse; width: 100%; margin-top: 12px; }
-    th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
-    th { background: #f7f7f7; text-align: left; }
-    .muted { color: #666; font-size: 0.92em; }
-    .btn { display: inline-block; padding: 10px 14px; border: 1px solid #333; border-radius: 8px; background: #fff; cursor: pointer; }
-    .btn-primary { background: #222; color: #fff; border-color: #222; }
-    .danger { color: #b00020; }
-    .ok { color: #0b6; }
+    th, td { border: 1px solid var(--line); padding: 10px; vertical-align: top; }
+    th { background: #f0f3ec; text-align: left; font-weight: 600; }
+    table tr:nth-child(even) td { background: #fafaf7; }
+    .muted { color: var(--muted); font-size: 0.92em; }
+    .btn {
+      display: inline-block;
+      padding: 10px 14px;
+      border: 1px solid var(--ink);
+      border-radius: 999px;
+      background: #fff;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn-primary {
+      background: var(--brand);
+      color: #fff;
+      border-color: var(--brand);
+    }
+    .danger { color: #b00020; font-weight: 600; }
+    .ok { color: #0b6; font-weight: 600; }
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-right: 6px;
+      background: #eef2ea;
+      border: 1px solid var(--line);
+    }
+    .badge-warn { background: #fff4dd; border-color: #f0d59b; }
+    .badge-alert { background: #ffe7e7; border-color: #f2b4b4; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-top: 10px; }
+    .stat-card {
+      padding: 12px;
+      border-radius: 14px;
+      background: linear-gradient(140deg, #ffffff 0%, #f6f8f2 100%);
+      border: 1px solid var(--line);
+    }
+    .stat-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+    .stat-value { font-size: 20px; font-weight: 700; margin-top: 6px; }
+    @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    @media (max-width: 720px) {
+      .site-header { position: static; }
+      .brand-title { font-size: 20px; }
+      .hero { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <h2>Church Pantry</h2>
-  <div class="nav">
-    <a href="{{ url_for('home') }}">Home</a> |
-    <a href="{{ url_for('member_request') }}">Member Request Form</a> |
-    {% if is_manager %}
-      <a href="{{ url_for('manager_stock') }}">Manager: Add / Update Stock</a> |
-      <a href="{{ url_for('manager_requests') }}">Manager: Approvals</a> |
-      <a href="/manager/stock_view">Manager: Stock Viewer</a> |
-      <a href="/manager/reports">Manager: Reports</a> |
-      <a href="/manager/logout">Manager Logout</a>
-    {% else %}
-      <a href="/manager/login">Manager Login</a>
-    {% endif %}
+  <div class="page">
+    <header class="site-header">
+      <div class="brand">
+        <img class="brand-logo" src="{{ logo_url }}" alt="{{ church_name }} logo" />
+        <div>
+          <div class="brand-title">{{ church_name }}</div>
+          <div class="brand-subtitle">{{ church_tagline }}</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <a href="{{ url_for('home') }}">Home</a>
+        <a href="{{ url_for('member_request') }}">Member Request Form</a>
+        {% if is_manager %}
+          <a href="{{ url_for('manager_stock') }}">Manager: Add / Update Stock</a>
+          <a href="{{ url_for('manager_requests') }}">Manager: Approvals</a>
+          <a href="/manager/stock_view">Manager: Stock Viewer</a>
+          <a href="/manager/reports">Manager: Reports</a>
+          <a href="/manager/logout">Manager Logout</a>
+        {% else %}
+          <a href="/manager/login">Manager Login</a>
+        {% endif %}
+      </nav>
+    </header>
+    <main class="content">
+      {{ body|safe }}
+    </main>
   </div>
-  {{ body|safe }}
 </body>
 </html>
 """
@@ -294,10 +452,21 @@ BASE = """
 @APP.get("/")
 def home():
     body = """
-    <div class="card">
-      <p><b>Member link:</b> <a href="/member/request">/member/request</a></p>
-      <p><b>Manager link:</b> <a href="/manager/login">/manager/login</a></p>
-      <p class="muted">Tip: Set PANTRY_MANAGER_PASSWORD on Render.</p>
+    <div class="card hero">
+      <div>
+        <h3>Welcome to the Pantry Portal</h3>
+        <p class="muted">We serve our community with compassion and organization. Members can request items online, and managers can keep inventory and approvals in one place.</p>
+        <div class="hero-badges">
+          <span class="hero-badge">Community</span>
+          <span class="hero-badge">Care</span>
+          <span class="hero-badge">Stewardship</span>
+        </div>
+      </div>
+      <div class="hero-card">
+        <p><b>Member link:</b> <a href="/member/request">/member/request</a></p>
+        <p><b>Manager link:</b> <a href="/manager/login">/manager/login</a></p>
+        <p class="muted">Tip: Set PANTRY_MANAGER_PASSWORD on Render.</p>
+      </div>
     </div>
     """
     return render_template_string(BASE, body=body)
@@ -467,6 +636,12 @@ def member_request_submit():
     finally:
         c.close()
 
+    try:
+        notify_manager_new_request(request_id, name, phone, email)
+        acknowledge_requester(request_id, email, name)
+    except Exception as exc:
+        print(f"⚠️ Email notification failed: {exc}")
+
     body = """
     <div class="card">
       <p class="ok"><b>Request submitted!</b></p>
@@ -480,10 +655,39 @@ def member_request_submit():
 @APP.get("/manager/stock")
 @requires_manager_auth
 def manager_stock():
+    q = (request.args.get("q") or "").strip()
+    sort = (request.args.get("sort") or "name").strip()
+    direction = (request.args.get("dir") or "asc").strip().lower()
+    sort_map = {
+        "name": "item_name",
+        "qty": "qty_available",
+        "expiry": "expiry_date",
+        "status": "is_active",
+    }
+    order_col = sort_map.get(sort, "item_name")
+    order_dir = "DESC" if direction == "desc" else "ASC"
+
     c = conn()
     try:
-        items = c.execute(
-            "SELECT item_id, item_name, unit, qty_available, expiry_date, is_active FROM items ORDER BY item_name"
+        items_all = c.execute(
+            "SELECT item_id, item_name FROM items ORDER BY item_name"
+        ).fetchall()
+
+        params = []
+        where_clause = ""
+        if q:
+            where_clause = "WHERE item_name LIKE ? OR unit LIKE ?"
+            like = f"%{q}%"
+            params.extend([like, like])
+
+        items_table = c.execute(
+            f"""
+            SELECT item_id, item_name, unit, qty_available, expiry_date, is_active
+            FROM items
+            {where_clause}
+            ORDER BY {order_col} {order_dir}, item_name
+            """,
+            params,
         ).fetchall()
     finally:
         c.close()
@@ -523,7 +727,7 @@ def manager_stock():
               <form method="POST" action="{{ url_for('manager_update_item') }}">
                 <label>Select Item *</label>
                 <select name="item_id" required>
-                  {% for it in items %}
+                  {% for it in items_all %}
                     <option value="{{ it['item_id'] }}">{{ it['item_name'] }}</option>
                   {% endfor %}
                 </select>
@@ -550,11 +754,41 @@ def manager_stock():
 
         <div class="card">
           <h4>Current Items (Members will see these)</h4>
+          <form method="GET" style="margin-bottom:10px;">
+            <div class="row">
+              <div>
+                <label>Search</label>
+                <input name="q" value="{{ q }}" placeholder="Search by name or unit" />
+              </div>
+              <div>
+                <label>Sort by</label>
+                <select name="sort">
+                  <option value="name" {% if sort == "name" %}selected{% endif %}>Name</option>
+                  <option value="qty" {% if sort == "qty" %}selected{% endif %}>Qty</option>
+                  <option value="expiry" {% if sort == "expiry" %}selected{% endif %}>Expiry</option>
+                  <option value="status" {% if sort == "status" %}selected{% endif %}>Status</option>
+                </select>
+              </div>
+              <div>
+                <label>Order</label>
+                <select name="dir">
+                  <option value="asc" {% if direction == "asc" %}selected{% endif %}>Ascending</option>
+                  <option value="desc" {% if direction == "desc" %}selected{% endif %}>Descending</option>
+                </select>
+              </div>
+              <div style="align-self:flex-end;">
+                <button class="btn btn-primary" type="submit">Apply</button>
+              </div>
+            </div>
+          </form>
           <table>
             <tr>
               <th>Item</th><th>Unit</th><th>Qty</th><th>Expiry</th><th>Status</th>
             </tr>
-            {% for it in items %}
+            {% if items_table|length == 0 %}
+              <tr><td colspan="5" class="muted">No items found.</td></tr>
+            {% else %}
+              {% for it in items_table %}
               <tr>
                 <td>{{ it["item_name"] }}</td>
                 <td>{{ it["unit"] }}</td>
@@ -562,11 +796,16 @@ def manager_stock():
                 <td>{% if it["expiry_date"] %}{{ it["expiry_date"] }}{% else %}<span class="muted">—</span>{% endif %}</td>
                 <td>{% if it["is_active"] == 1 %}<span class="ok">Active</span>{% else %}<span class="danger">Inactive</span>{% endif %}</td>
               </tr>
-            {% endfor %}
+              {% endfor %}
+            {% endif %}
           </table>
         </div>
         """,
-        items=items,
+        items_all=items_all,
+        items_table=items_table,
+        q=q,
+        sort=sort,
+        direction=direction,
     )
     return render_template_string(BASE, body=body)
 
@@ -644,16 +883,39 @@ def manager_update_item():
 @APP.get("/manager/requests")
 @requires_manager_auth
 def manager_requests():
+    q = (request.args.get("q") or "").strip()
+    sort = (request.args.get("sort") or "id").strip()
+    direction = (request.args.get("dir") or "desc").strip().lower()
+    sort_map = {
+        "id": "r.request_id",
+        "status": "r.status",
+        "created": "r.created_at",
+    }
+    order_col = sort_map.get(sort, "r.request_id")
+    order_dir = "DESC" if direction == "desc" else "ASC"
+
     c = conn()
     try:
+        params = []
+        where_clause = ""
+        if q:
+            where_clause = (
+                "WHERE m.name LIKE ? OR m.phone LIKE ? OR m.email LIKE ? "
+                "OR CAST(r.request_id AS TEXT) LIKE ?"
+            )
+            like = f"%{q}%"
+            params.extend([like, like, like, like])
+
         reqs = c.execute(
-            """
+            f"""
             SELECT r.request_id, r.status, r.note, r.created_at,
                    m.name, m.phone, m.email
             FROM requests r
             JOIN members m ON m.member_id = r.member_id
-            ORDER BY r.request_id DESC
-            """
+            {where_clause}
+            ORDER BY {order_col} {order_dir}
+            """,
+            params,
         ).fetchall()
 
         items_by_req = {}
@@ -675,6 +937,35 @@ def manager_requests():
         """
         <div class="card">
           <h3>Manager: Approvals | <a href="/manager/stock_view">Manager: Stock Viewer</a> | <a href="/manager/reports">Manager: Reports</a></h3>
+          <form method="GET" style="margin-top:10px;">
+            <div class="row">
+              <div>
+                <label>Search</label>
+                <input name="q" value="{{ q }}" placeholder="Search by name, email, phone, or request id" />
+              </div>
+              <div>
+                <label>Sort by</label>
+                <select name="sort">
+                  <option value="id" {% if sort == "id" %}selected{% endif %}>Request ID</option>
+                  <option value="status" {% if sort == "status" %}selected{% endif %}>Status</option>
+                  <option value="created" {% if sort == "created" %}selected{% endif %}>Created</option>
+                </select>
+              </div>
+              <div>
+                <label>Order</label>
+                <select name="dir">
+                  <option value="desc" {% if direction == "desc" %}selected{% endif %}>Descending</option>
+                  <option value="asc" {% if direction == "asc" %}selected{% endif %}>Ascending</option>
+                </select>
+              </div>
+              <div style="align-self:flex-end;">
+                <button class="btn btn-primary" type="submit">Apply</button>
+              </div>
+              <div style="align-self:flex-end;">
+                <a class="btn" href="/manager/requests.csv?q={{ q }}&sort={{ sort }}&dir={{ direction }}">Export CSV</a>
+              </div>
+            </div>
+          </form>
           {% if reqs|length == 0 %}
             <p class="muted">No requests yet.</p>
           {% endif %}
@@ -715,8 +1006,92 @@ def manager_requests():
         """,
         reqs=reqs,
         items_by_req=items_by_req,
+        q=q,
+        sort=sort,
+        direction=direction,
     )
     return render_template_string(BASE, body=body)
+
+
+@APP.get("/manager/requests.csv")
+@requires_manager_auth
+def manager_requests_csv():
+    q = (request.args.get("q") or "").strip()
+    sort = (request.args.get("sort") or "id").strip()
+    direction = (request.args.get("dir") or "desc").strip().lower()
+    sort_map = {
+        "id": "r.request_id",
+        "status": "r.status",
+        "created": "r.created_at",
+    }
+    order_col = sort_map.get(sort, "r.request_id")
+    order_dir = "DESC" if direction == "desc" else "ASC"
+
+    c = conn()
+    try:
+        params = []
+        where_clause = ""
+        if q:
+            where_clause = (
+                "WHERE m.name LIKE ? OR m.phone LIKE ? OR m.email LIKE ? "
+                "OR CAST(r.request_id AS TEXT) LIKE ?"
+            )
+            like = f"%{q}%"
+            params.extend([like, like, like, like])
+
+        reqs = c.execute(
+            f"""
+            SELECT r.request_id, r.status, r.note, r.created_at,
+                   m.name, m.phone, m.email
+            FROM requests r
+            JOIN members m ON m.member_id = r.member_id
+            {where_clause}
+            ORDER BY {order_col} {order_dir}
+            """,
+            params,
+        ).fetchall()
+
+        rows = [
+            [
+                "request_id",
+                "status",
+                "created_at",
+                "member_name",
+                "phone",
+                "email",
+                "note",
+                "items",
+            ]
+        ]
+        for r in reqs:
+            items = c.execute(
+                """
+                SELECT i.item_name, i.unit, ri.qty_requested
+                FROM request_items ri
+                JOIN items i ON i.item_id = ri.item_id
+                WHERE ri.request_id = ?
+                """,
+                (r["request_id"],),
+            ).fetchall()
+            item_text = "; ".join(
+                [f"{it['item_name']} ({it['unit']}) x {it['qty_requested']}" for it in items]
+            )
+            rows.append(
+                [
+                    r["request_id"],
+                    r["status"],
+                    r["created_at"],
+                    r["name"],
+                    r["phone"],
+                    r["email"],
+                    r["note"] or "",
+                    item_text,
+                ]
+            )
+    finally:
+        c.close()
+
+    return csv_response("requests.csv", rows)
 
 
 @APP.get("/manager/reports")
@@ -817,6 +1192,45 @@ def manager_reports():
         <div class="card">
           <h3>Manager: Reports</h3>
           <p class="muted">Defaults: low-stock <= {{ low_threshold }}, expiring in {{ exp_days }} days.</p>
+          <form method="get" class="row">
+            <div>
+              <label>Low stock threshold</label>
+              <input name="low" type="number" min="0" step="1" value="{{ low_threshold }}" />
+            </div>
+            <div>
+              <label>Expiring within (days)</label>
+              <input name="exp" type="number" min="1" step="1" value="{{ exp_days }}" />
+            </div>
+            <div style="align-self:flex-end;">
+              <button class="btn btn-primary" type="submit">Apply Filters</button>
+            </div>
+          </form>
+          <div class="stats">
+            <div class="stat-card">
+              <div class="stat-label">Total Items</div>
+              <div class="stat-value">{{ total_items }}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">In Stock Items</div>
+              <div class="stat-value">{{ in_stock_items }}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Out of Stock Items</div>
+              <div class="stat-value">{{ out_stock_items }}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Active Items</div>
+              <div class="stat-value">{{ active_items }}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Total Requests</div>
+              <div class="stat-value">{{ total_requests }}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Requests (30 days)</div>
+              <div class="stat-value">{{ recent_requests }}</div>
+            </div>
+          </div>
         </div>
 
         <div class="card">
@@ -832,7 +1246,10 @@ def manager_reports():
         </div>
 
         <div class="card">
-          <h4>Low Stock (<= {{ low_threshold }})</h4>
+          <div style="display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px;">
+            <h4>Low Stock (<= {{ low_threshold }})</h4>
+            <a class="btn" href="/manager/reports/export/low_stock?low={{ low_threshold }}">Export CSV</a>
+          </div>
           <table>
             <tr><th>Item</th><th>Unit</th><th>Qty</th></tr>
             {% if low_stock|length == 0 %}
@@ -850,7 +1267,10 @@ def manager_reports():
         </div>
 
         <div class="card">
-          <h4>Expiring Soon (next {{ exp_days }} days)</h4>
+          <div style="display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px;">
+            <h4>Expiring Soon (next {{ exp_days }} days)</h4>
+            <a class="btn" href="/manager/reports/export/expiring?exp={{ exp_days }}">Export CSV</a>
+          </div>
           <table>
             <tr><th>Item</th><th>Unit</th><th>Qty</th><th>Expiry</th></tr>
             {% if expiring|length == 0 %}
@@ -948,6 +1368,76 @@ def manager_reports():
     return render_template_string(BASE, body=body)
 
 
+@APP.get("/manager/reports/export/<string:kind>")
+@requires_manager_auth
+def manager_reports_export(kind: str):
+    try:
+        low_threshold = int(request.args.get("low", "5"))
+    except ValueError:
+        low_threshold = 5
+
+    try:
+        exp_days = int(request.args.get("exp", "30"))
+    except ValueError:
+        exp_days = 30
+
+    c = conn()
+    try:
+        if kind == "low_stock":
+            rows = c.execute(
+                """
+                SELECT item_name, unit, qty_available
+                FROM items
+                WHERE is_active=1 AND COALESCE(qty_available, 0) > 0 AND qty_available <= ?
+                ORDER BY qty_available ASC, item_name
+                """,
+                (low_threshold,),
+            ).fetchall()
+            csv_rows = [["item_name", "unit", "qty_available"]]
+            for it in rows:
+                csv_rows.append([it["item_name"], it["unit"], it["qty_available"]])
+            return csv_response("low_stock.csv", csv_rows)
+
+        if kind == "expiring":
+            rows = c.execute(
+                """
+                SELECT item_name, unit, qty_available, expiry_date
+                FROM items
+                WHERE expiry_date IS NOT NULL
+                  AND date(expiry_date) <= date('now', ?)
+                ORDER BY date(expiry_date), item_name
+                """,
+                (f"+{exp_days} day",),
+            ).fetchall()
+            csv_rows = [["item_name", "unit", "qty_available", "expiry_date"]]
+            for it in rows:
+                csv_rows.append([it["item_name"], it["unit"], it["qty_available"], it["expiry_date"]])
+            return csv_response("expiring_soon.csv", csv_rows)
+    finally:
+        c.close()
+
+    abort(404, "Unknown export type")
+
+
+def build_stock_flags(expiry_date: str | None, qty_available: float, is_active: int, low_threshold: int, exp_days: int, today_date):
+    labels = []
+    if is_active != 1:
+        labels.append("Inactive")
+    if qty_available > 0 and qty_available <= low_threshold:
+        labels.append("Low stock")
+    if expiry_date:
+        try:
+            exp_date = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+            days_left = (exp_date - today_date).days
+            if days_left < 0:
+                labels.append("Expired")
+            elif days_left <= exp_days:
+                labels.append("Expiring soon")
+        except ValueError:
+            pass
+    return labels
+
+
 @APP.post("/manager/decide")
 @requires_manager_auth
 def manager_decide_request():
@@ -1023,45 +1513,193 @@ def manager_decide_request():
 @APP.route("/manager/stock_view")
 @requires_manager_auth
 def manager_stock_view():
+    q = (request.args.get("q") or "").strip()
+    sort = (request.args.get("sort") or "name").strip()
+    direction = (request.args.get("dir") or "asc").strip().lower()
+    sort_map = {
+        "name": "item_name",
+        "qty": "qty_available",
+        "expiry": "expiry_date",
+        "status": "is_active",
+    }
+    order_col = sort_map.get(sort, "item_name")
+    order_dir = "DESC" if direction == "desc" else "ASC"
+
+    try:
+        low_threshold = int(request.args.get("low", "5"))
+    except ValueError:
+        low_threshold = 5
+
+    try:
+        exp_days = int(request.args.get("exp", "30"))
+    except ValueError:
+        exp_days = 30
+
     c = conn()
     try:
-        items = c.execute("""
-            SELECT item_id, item_name, unit, qty_available, expiry_date, is_active
+        params = []
+        where_clause = ""
+        if q:
+            where_clause = "WHERE item_name LIKE ? OR unit LIKE ?"
+            like = f"%{q}%"
+            params.extend([like, like])
+
+        items = c.execute(
+            f"""
+            SELECT item_id, item_name, unit, qty_available, expiry_date, is_active, image_url
             FROM items
-            ORDER BY item_name
-        """).fetchall()
+            {where_clause}
+            ORDER BY {order_col} {order_dir}, item_name
+            """,
+            params,
+        ).fetchall()
     finally:
         c.close()
 
     rows = []
+    today = datetime.utcnow().date()
     for it in items:
         status = "Active" if (it["is_active"] == 1) else "Inactive"
+        qty_available = float(it["qty_available"] or 0.0)
+        flags = build_stock_flags(it["expiry_date"], qty_available, it["is_active"], low_threshold, exp_days, today)
+        badge_parts = []
+        for label in flags:
+            badge_class = "badge-alert" if ("Expiring" in label or "Expired" in label or label == "Inactive") else "badge-warn"
+            badge_parts.append(f'<span class="badge {badge_class}">{label}</span>')
+        badges_html = " ".join(badge_parts) if badge_parts else '<span class="muted">-</span>'
+        img_html = ""
+        if it["image_url"]:
+            img_html = (
+                f'<img src="{it["image_url"]}" alt="{it["item_name"]}" '
+                'style="max-width:70px; max-height:70px; display:block;" />'
+            )
         rows.append(f"""
         <tr>
+          <td>{img_html}</td>
           <td>{it["item_name"]}</td>
           <td>{it["unit"]}</td>
-          <td>{it["qty_available"]:.2f}</td>
+          <td>{qty_available:.2f}</td>
           <td>{it["expiry_date"] or ""}</td>
           <td>{status}</td>
+          <td>{badges_html}</td>
         </tr>
         """)
 
     body = f"""
     <h2>Current Stock (Manager View)</h2>
     <p><a href="/manager/stock">Back to Intake</a></p>
+    <div class="card">
+      <form method="GET">
+        <div class="row">
+          <div>
+            <label>Search</label>
+            <input name="q" value="{q}" placeholder="Search by name or unit" />
+          </div>
+          <div>
+            <label>Sort by</label>
+            <select name="sort">
+              <option value="name" {"selected" if sort == "name" else ""}>Name</option>
+              <option value="qty" {"selected" if sort == "qty" else ""}>Qty</option>
+              <option value="expiry" {"selected" if sort == "expiry" else ""}>Expiry</option>
+              <option value="status" {"selected" if sort == "status" else ""}>Status</option>
+            </select>
+          </div>
+          <div>
+            <label>Order</label>
+            <select name="dir">
+              <option value="asc" {"selected" if direction == "asc" else ""}>Ascending</option>
+              <option value="desc" {"selected" if direction == "desc" else ""}>Descending</option>
+            </select>
+          </div>
+          <div>
+            <label>Low stock <=</label>
+            <input name="low" type="number" min="0" step="1" value="{low_threshold}" />
+          </div>
+          <div>
+            <label>Expiring within days</label>
+            <input name="exp" type="number" min="1" step="1" value="{exp_days}" />
+          </div>
+          <div style="align-self:flex-end;">
+            <button class="btn btn-primary" type="submit">Apply</button>
+          </div>
+          <div style="align-self:flex-end;">
+            <a class="btn" href="/manager/stock_view.csv?q={q}&sort={sort}&dir={direction}&low={low_threshold}&exp={exp_days}">Export CSV</a>
+          </div>
+        </div>
+      </form>
+    </div>
     <table border="1" cellpadding="8" cellspacing="0">
-      <tr><th>Item</th><th>Unit</th><th>Qty</th><th>Expiry</th><th>Status</th></tr>
-      {''.join(rows) if rows else '<tr><td colspan="5">No items found</td></tr>'}
+      <tr><th>Image</th><th>Item</th><th>Unit</th><th>Qty</th><th>Expiry</th><th>Status</th><th>Flags</th></tr>
+      {''.join(rows) if rows else '<tr><td colspan="7">No items found</td></tr>'}
     </table>
     """
     return render_template_string(BASE, body=body)
 
 
-# ============================================================
-# Local run
-# ============================================================
-if __name__ == "__main__":
-    APP.run(host="0.0.0.0", port=5000, debug=True)
+@APP.get("/manager/stock_view.csv")
+@requires_manager_auth
+def manager_stock_view_csv():
+    q = (request.args.get("q") or "").strip()
+    sort = (request.args.get("sort") or "name").strip()
+    direction = (request.args.get("dir") or "asc").strip().lower()
+    sort_map = {
+        "name": "item_name",
+        "qty": "qty_available",
+        "expiry": "expiry_date",
+        "status": "is_active",
+    }
+    order_col = sort_map.get(sort, "item_name")
+    order_dir = "DESC" if direction == "desc" else "ASC"
+
+    try:
+        low_threshold = int(request.args.get("low", "5"))
+    except ValueError:
+        low_threshold = 5
+
+    try:
+        exp_days = int(request.args.get("exp", "30"))
+    except ValueError:
+        exp_days = 30
+
+    c = conn()
+    try:
+        params = []
+        where_clause = ""
+        if q:
+            where_clause = "WHERE item_name LIKE ? OR unit LIKE ?"
+            like = f"%{q}%"
+            params.extend([like, like])
+
+        items = c.execute(
+            f"""
+            SELECT item_id, item_name, unit, qty_available, expiry_date, is_active
+            FROM items
+            {where_clause}
+            ORDER BY {order_col} {order_dir}, item_name
+            """,
+            params,
+        ).fetchall()
+    finally:
+        c.close()
+
+    today = datetime.utcnow().date()
+    rows = [["item_name", "unit", "qty_available", "expiry_date", "status", "flags"]]
+    for it in items:
+        qty_available = float(it["qty_available"] or 0.0)
+        status = "Active" if (it["is_active"] == 1) else "Inactive"
+        flags = build_stock_flags(it["expiry_date"], qty_available, it["is_active"], low_threshold, exp_days, today)
+        rows.append(
+            [
+                it["item_name"],
+                it["unit"],
+                qty_available,
+                it["expiry_date"] or "",
+                status,
+                ", ".join(flags),
+            ]
+        )
+
+    return csv_response("stock_view.csv", rows)
 
 
 @APP.route("/manager/review/<int:req_id>")
@@ -1131,3 +1769,10 @@ def manager_review_request(req_id: int):
     </table>
     """
     return render_template_string(BASE, body=body)
+
+
+# ============================================================
+# Local run
+# ============================================================
+if __name__ == "__main__":
+    APP.run(host="0.0.0.0", port=5000, debug=True)
