@@ -620,7 +620,7 @@ def home():
           <span class="hero-badge">Care</span>
           <span class="hero-badge">Stewardship</span>
         </div>
-        <img class="hero-image" src="/static/hero_pantry.jpg" alt="Sharing food and pantry support" />
+        <img class="hero-image" src="/static/hero_pantry.webp" alt="Sharing food and pantry support" />
       </div>
       <div class="hero-card">
         <svg width="220" height="140" viewBox="0 0 220 140" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Community care">
