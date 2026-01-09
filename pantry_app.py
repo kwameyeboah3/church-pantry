@@ -355,7 +355,12 @@ def requires_manager_auth(func):
 
 
 def current_manager_name() -> str:
-    return session.get("manager_username") or "manager"
+    if session.get("manager_username"):
+        return session.get("manager_username")
+    auth = request.authorization
+    if auth and check_manager_credentials(auth.username, auth.password):
+        return auth.username
+    return "manager"
 
 
 @APP.context_processor
@@ -541,15 +546,15 @@ BASE = """
         <a href="{{ url_for('home') }}">Home</a>
         <a href="{{ url_for('member_request') }}">Member Request Form</a>
         {% if is_manager %}
-          <a href="{{ url_for('manager_stock') }}">Manager: Add / Update Stock</a>
-          <a href="{{ url_for('manager_requests') }}">Manager: Approvals</a>
-          <a href="/manager/stock_view">Manager: Stock Viewer</a>
-          <a href="/manager/reports">Manager: Reports</a>
-          <a href="/manager/profile">Manager: Profile</a>
-          <a href="/manager/managers">Manager: Users</a>
-          <a href="/manager/logout">Manager Logout</a>
+          <a href="{{ url_for('manager_stock') }}">Stock Intake</a>
+          <a href="{{ url_for('manager_requests') }}">Approvals</a>
+          <a href="/manager/stock_view">Stock View</a>
+          <a href="/manager/reports">Reports</a>
+          <a href="/manager/profile">Profile</a>
+          <a href="/manager/managers">Users</a>
+          <a href="/manager/logout">Logout</a>
         {% else %}
-          <a href="/manager/login">Manager Login</a>
+          <a href="/manager/login">Login</a>
         {% endif %}
       </nav>
     </header>
@@ -1173,7 +1178,7 @@ def manager_stock():
     body = render_template_string(
         """
         <div class="card">
-          <h3>Manager: Add / Update Stock (Intake)</h3>
+          <h3>Stock Intake</h3>
 
           <div class="row">
             <div class="card" style="flex:1;">
@@ -1460,7 +1465,7 @@ def manager_requests():
     body = render_template_string(
         """
         <div class="card">
-          <h3>Manager: Approvals | <a href="/manager/stock_view">Manager: Stock Viewer</a> | <a href="/manager/reports">Manager: Reports</a></h3>
+          <h3>Approvals | <a href="/manager/stock_view">Stock View</a> | <a href="/manager/reports">Reports</a></h3>
           <form method="GET" style="margin-top:10px;">
             <div class="row">
               <div>
@@ -2015,7 +2020,7 @@ def manager_reports():
     body = render_template_string(
         """
         <div class="card">
-          <h3>Manager: Reports</h3>
+          <h3>Reports</h3>
           <p class="muted">Defaults: low-stock <= {{ low_threshold }}, expiring in {{ exp_days }} days.</p>
           <form method="get" class="row">
             <div>
@@ -2527,7 +2532,7 @@ def manager_stock_view():
         """)
 
     body = f"""
-    <h2>Current Stock (Manager View)</h2>
+    <h2>Current Stock</h2>
     <p><a href="/manager/stock">Back to Intake</a></p>
     <div class="card">
       <form method="GET">
