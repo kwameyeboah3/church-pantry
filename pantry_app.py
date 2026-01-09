@@ -322,8 +322,8 @@ BASE = """
       gap: 12px;
     }
     .brand-logo {
-      width: 54px;
-      height: 54px;
+      width: 84px;
+      height: 84px;
       border-radius: 50%;
       border: 2px solid var(--accent);
       background: #fff;
@@ -455,17 +455,12 @@ def home():
     <div class="card hero">
       <div>
         <h3>Welcome to the Pantry Portal</h3>
-        <p class="muted">We serve our community with compassion and organization. Members can request items online, and managers can keep inventory and approvals in one place.</p>
+        <p class="muted">We serve our community with compassion and organization. Members can request items online.</p>
         <div class="hero-badges">
           <span class="hero-badge">Community</span>
           <span class="hero-badge">Care</span>
           <span class="hero-badge">Stewardship</span>
         </div>
-      </div>
-      <div class="hero-card">
-        <p><b>Member link:</b> <a href="/member/request">/member/request</a></p>
-        <p><b>Manager link:</b> <a href="/manager/login">/manager/login</a></p>
-        <p class="muted">Tip: Set PANTRY_MANAGER_PASSWORD on Render.</p>
       </div>
     </div>
     """
