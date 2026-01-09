@@ -45,19 +45,43 @@ def conn():
 
 _DB_READY = False
 
+_DB_READY = False
+
+def _table_exists(c, name: str) -> bool:
+    r = c.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (name,)
+    ).fetchone()
+    return r is not None
+
 def ensure_db():
+    """
+    Ensure SQLite schema exists before any request handler runs.
+    Works on fresh Render instances where /tmp DB starts empty.
+    """
     global _DB_READY
     if _DB_READY:
         return
-    # 1) Create base tables (safe if already exists)
-    init_db()
-    # 2) Apply safe migrations (only alters if needed)
+
+    # Use the SAME connection function the rest of the app uses
+    c = conn()
     try:
-        migrate_schema()
-    except Exception as e:
-        # Don't crash the whole app if migration is unnecessary or partially applied
-        print("migrate_schema() warning:", e)
-    _DB_READY = True
+        # If core table missing, create everything first
+        if not _table_exists(c, "items"):
+            init_db()
+
+        # Now safe to run migrations (ALTER TABLE etc.)
+        try:
+            migrate_schema()
+        except Exception as e:
+            print("migrate_schema() warning:", e)
+
+        _DB_READY = True
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
 
 import base64
 from functools import wraps
@@ -266,40 +290,33 @@ BASE = """
 
 def migrate_schema():
     """
-    Safe SQLite migrations (Render may start with a fresh DB).
-    Adds columns that newer code expects.
+    Safe SQLite migrations.
+    Only runs ALTERs if the base tables already exist.
     """
-    c = raw_conn()
-    # If base tables aren't created yet, do nothing (init_db will handle)
-    row = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='items'").fetchone()
-    if not row:
-        c.close()
-        return
+    c = conn()
+    try:
+        # If items table doesn't exist yet, skip (init_db will create it)
+        r = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='items' LIMIT 1"
+        ).fetchone()
+        if not r:
+            return
 
-    # --- items table columns ---
-    cols = [r[1] for r in c.execute("PRAGMA table_info(items);").fetchall()]
+        cols = {row["name"] for row in c.execute("PRAGMA table_info(items)").fetchall()}
 
-    if "image_url" not in cols:
-        try:
-
+        if "image_url" not in cols:
             c.execute("ALTER TABLE items ADD COLUMN image_url TEXT")
 
-        except Exception:
-
-            pass
-    if "is_active" not in cols:
-        # default active
-        try:
-
+        if "is_active" not in cols:
             c.execute("ALTER TABLE items ADD COLUMN is_active INTEGER DEFAULT 1")
 
-        except Exception:
+        if "expiry_date" not in cols:
+            c.execute("ALTER TABLE items ADD COLUMN expiry_date TEXT")
 
-            pass
+        c.commit()
+    finally:
+        c.close()
 
-    # You can add more migrations here later if you change schema.
-    c.commit()
-    c.close()
 def _ensure_db_before_request():
     ensure_db()
 
