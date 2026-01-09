@@ -29,20 +29,40 @@ def save_item_image(file_storage, item_name: str) -> str:
 
 DB = os.environ.get('PANTRY_DB_PATH', '/tmp/church_pantry.db')
 def raw_conn():
-    c = sqlite3.connect(DB)
+    c = conn()
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys = ON;")
     return c
 
 
 def conn():
-    # Normal app connection used everywhere else
-    c = sqlite3.connect(DB)
+    """
+    Single source of truth DB connection.
+    Also auto-creates tables on first use (important on Render /tmp).
+    """
+    c = conn()
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys = ON;")
+
+    # Ensure schema exists in *this same DB file*
+    try:
+        r = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='items' LIMIT 1"
+        ).fetchone()
+        if not r:
+            # Close this connection before init_db() (which creates tables)
+            c.close()
+            init_db()
+
+            # Re-open after init_db()
+            c = conn()
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA foreign_keys = ON;")
+    except Exception as e:
+        # Don't crash boot — but do log
+        print("conn() schema check warning:", e)
+
     return c
-
-
 _DB_READY = False
 
 _DB_READY = False
@@ -126,7 +146,7 @@ def manager_protect(fn):
 
 
 def raw_conn():
-    c = sqlite3.connect(DB)
+    c = conn()
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys = ON;")
     return c
