@@ -311,12 +311,6 @@ BASE = """
 @APP.before_request
 
 
-# STARTUP_DB_INIT: ensure tables exist on Render (/tmp may be empty on restart)
-try:
-    init_db()
-    print('✅ init_db() OK')
-except Exception as e:
-    print('init_db() warning:', e)
 def migrate_schema():
     """
     Safe SQLite migrations.
