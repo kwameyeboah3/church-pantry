@@ -309,7 +309,8 @@ BASE = """
 
 
 @APP.before_request
-
+def _ensure_db_before_request():
+    ensure_db()
 
 def migrate_schema():
     """
