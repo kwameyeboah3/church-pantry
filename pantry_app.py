@@ -7,12 +7,6 @@ import sqlite3
 
 APP = Flask(__name__)
 
-# STARTUP_DB_INIT: ensure tables exist on Render (/tmp is empty each deploy)
-try:
-    init_db()
-    print('✅ init_db() OK')
-except Exception as e:
-    print('init_db() warning:', e)
 
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'static', 'items')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -316,6 +310,13 @@ BASE = """
 
 @APP.before_request
 
+
+# STARTUP_DB_INIT: ensure tables exist on Render (/tmp may be empty on restart)
+try:
+    init_db()
+    print('✅ init_db() OK')
+except Exception as e:
+    print('init_db() warning:', e)
 def migrate_schema():
     """
     Safe SQLite migrations.
