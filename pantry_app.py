@@ -3153,6 +3153,7 @@ def manager_sync_render():
     if request.method == "POST":
         confirm = request.form.get("confirm") == "yes"
         direction = request.form.get("direction") or "push"
+        mirror_local = request.form.get("mirror_local") == "yes"
         if request.form.get("save_settings") == "yes":
             session["render_base"] = (request.form.get("render_base") or "").strip().rstrip("/")
             session["sync_token"] = (request.form.get("sync_token") or "").strip()
@@ -3197,6 +3198,18 @@ def manager_sync_render():
                         reader = csv.DictReader(items_stream)
                         c = conn()
                         try:
+                            if mirror_local:
+                                c.execute("DELETE FROM request_items")
+                                c.execute("DELETE FROM requests")
+                                c.execute("DELETE FROM members")
+                                c.execute("DELETE FROM stock_movements")
+                                c.execute("DELETE FROM items")
+                                c.execute("DELETE FROM managers")
+                                if os.path.isdir(UPLOAD_FOLDER):
+                                    for root, _, files in os.walk(UPLOAD_FOLDER):
+                                        for fname in files:
+                                            os.remove(os.path.join(root, fname))
+
                             for row in reader:
                                 item_id_text = (row.get("item_id") or "").strip()
                                 name = (row.get("item_name") or "").strip()
@@ -3540,6 +3553,14 @@ def manager_sync_render():
               <input type="checkbox" name="confirm" value="yes" />
               I understand this will overwrite data on Render.
             </label>
+            <div class="card" style="margin-top:12px;">
+              <h4>Mirror Mode (optional)</h4>
+              <p class="muted">When checked, "Sync from Render" replaces local data to match Render exactly.</p>
+              <label>
+                <input type="checkbox" name="mirror_local" value="yes" />
+                Replace local data with Render (wipe local first)
+              </label>
+            </div>
             <p style="margin-top:12px;">
               <button class="btn btn-primary" type="submit" name="direction" value="push">Sync to Render</button>
               <button class="btn" type="submit" name="direction" value="pull">Sync from Render</button>
