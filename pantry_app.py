@@ -2,6 +2,7 @@ import csv
 import io
 import os
 import sqlite3
+import zipfile
 from datetime import datetime, timedelta
 from flask import Flask, request, redirect, url_for, render_template_string, Response, abort, session
 from email.message import EmailMessage
@@ -105,6 +106,42 @@ def csv_response(filename: str, rows: list[list[str]]) -> Response:
     resp = Response(output.getvalue(), mimetype="text/csv")
     resp.headers["Content-Disposition"] = f"attachment; filename={filename}"
     return resp
+
+
+def parse_bool_status(value: str) -> int:
+    if not value:
+        return 1
+    val = value.strip().lower()
+    if val in ("inactive", "0", "false", "no"):
+        return 0
+    return 1
+
+
+def parse_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def safe_extract_zip(zf: zipfile.ZipFile, target_dir: str, allow_prefixes: tuple[str, ...]):
+    for member in zf.infolist():
+        if member.is_dir():
+            continue
+        name = member.filename.replace("\\", "/")
+        if name.startswith("/") or ".." in name:
+            continue
+        if not name.startswith(allow_prefixes):
+            continue
+        out_path = os.path.join(target_dir, name)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with zf.open(member) as src, open(out_path, "wb") as dst:
+            dst.write(src.read())
 
 def notify_manager_new_request(req_id: int, member_name: str, phone: str, email: str):
     manager_emails = get_manager_emails()
@@ -588,6 +625,8 @@ BASE = """
           <a href="{{ url_for('manager_requests') }}">Approvals</a>
           <a href="/manager/stock_view">Stock View</a>
           <a href="/manager/reports">Reports</a>
+          <a href="/manager/backup">Backup</a>
+          <a href="/manager/import">Import</a>
           <a href="/manager/profile">Profile</a>
           <a href="/manager/managers">Users</a>
           <a href="/manager/logout">Logout</a>
@@ -2718,6 +2757,479 @@ def manager_items_csv():
         )
 
     return csv_response("items.csv", rows)
+
+
+@APP.get("/manager/managers.csv")
+@requires_manager_auth
+def manager_managers_csv():
+    c = conn()
+    try:
+        rows = c.execute(
+            """
+            SELECT manager_id, username, email, password_hash, is_active, created_at
+            FROM managers
+            ORDER BY username
+            """
+        ).fetchall()
+    finally:
+        c.close()
+
+    csv_rows = [
+        ["manager_id", "username", "email", "password_hash", "is_active", "created_at"]
+    ]
+    for r in rows:
+        csv_rows.append(
+            [
+                r["manager_id"],
+                r["username"],
+                r["email"] or "",
+                r["password_hash"],
+                r["is_active"],
+                r["created_at"],
+            ]
+        )
+    return csv_response("managers.csv", csv_rows)
+
+
+@APP.get("/manager/stock_movements.csv")
+@requires_manager_auth
+def manager_stock_movements_csv():
+    c = conn()
+    try:
+        rows = c.execute(
+            """
+            SELECT movement_id, item_id, movement_type, qty, note, created_by, created_at
+            FROM stock_movements
+            ORDER BY movement_id
+            """
+        ).fetchall()
+    finally:
+        c.close()
+
+    csv_rows = [
+        ["movement_id", "item_id", "movement_type", "qty", "note", "created_by", "created_at"]
+    ]
+    for r in rows:
+        csv_rows.append(
+            [
+                r["movement_id"],
+                r["item_id"],
+                r["movement_type"],
+                r["qty"],
+                r["note"] or "",
+                r["created_by"],
+                r["created_at"],
+            ]
+        )
+    return csv_response("stock_movements.csv", csv_rows)
+
+
+@APP.get("/manager/uploads.zip")
+@requires_manager_auth
+def manager_uploads_zip():
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if os.path.isdir(UPLOAD_FOLDER):
+            for root, _, files in os.walk(UPLOAD_FOLDER):
+                for fname in files:
+                    full_path = os.path.join(root, fname)
+                    rel_path = os.path.relpath(full_path, UPLOAD_FOLDER)
+                    zf.write(full_path, os.path.join("uploads", rel_path))
+        static_files = ["church_logo.jpeg", "hero_pantry.jpg", "hero_pantry.webp"]
+        static_dir = os.path.join(os.path.dirname(__file__), "static")
+        for fname in static_files:
+            full_path = os.path.join(static_dir, fname)
+            if os.path.exists(full_path):
+                zf.write(full_path, os.path.join("static", fname))
+    mem.seek(0)
+    resp = Response(mem.read(), mimetype="application/zip")
+    resp.headers["Content-Disposition"] = "attachment; filename=uploads.zip"
+    return resp
+
+
+@APP.get("/manager/backup")
+@requires_manager_auth
+def manager_backup():
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Full Backup</h3>
+          <p class="muted">Download all CSVs and the uploads zip to restore later.</p>
+          <div class="row">
+            <div>
+              <a class="btn" href="/manager/items.csv">Items CSV</a>
+            </div>
+            <div>
+              <a class="btn" href="/manager/requests.csv">Requests CSV</a>
+            </div>
+            <div>
+              <a class="btn" href="/manager/managers.csv">Managers CSV</a>
+            </div>
+            <div>
+              <a class="btn" href="/manager/stock_movements.csv">Stock Movements CSV</a>
+            </div>
+            <div>
+              <a class="btn" href="/manager/uploads.zip">Uploads ZIP</a>
+            </div>
+          </div>
+          <div class="card">
+            <h4>Restore Order</h4>
+            <p class="muted">Import items, then requests, then stock movements and managers. Upload uploads.zip last.</p>
+          </div>
+        </div>
+        """
+    )
+    return render_template_string(BASE, body=body)
+
+
+@APP.route("/manager/import", methods=["GET", "POST"])
+@requires_manager_auth
+def manager_import():
+    message = ""
+    error = ""
+
+    if request.method == "POST":
+        import_type = (request.form.get("import_type") or "").strip()
+        csv_file = request.files.get("csv_file")
+        if not import_type:
+            error = "Please choose an import type."
+        elif not csv_file or not csv_file.filename:
+            error = "Please upload a CSV file."
+        else:
+            stream = io.TextIOWrapper(csv_file.stream, encoding="utf-8", errors="replace")
+            reader = csv.DictReader(stream)
+            if import_type == "items":
+                created = 0
+                updated = 0
+                c = conn()
+                try:
+                    for row in reader:
+                        name = (row.get("item_name") or "").strip()
+                        unit = (row.get("unit") or "").strip()
+                        qty = parse_float(row.get("qty_available")) or 0.0
+                        unit_cost = parse_float(row.get("unit_cost"))
+                        expiry_date = (row.get("expiry_date") or "").strip() or None
+                        is_active = parse_bool_status(row.get("status") or "")
+                        if not name or not unit:
+                            continue
+                        existing = c.execute(
+                            "SELECT item_id FROM items WHERE item_name=?",
+                            (name,),
+                        ).fetchone()
+                        if existing:
+                            c.execute(
+                                """
+                                UPDATE items
+                                SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
+                                WHERE item_id=?
+                                """,
+                                (unit, qty, unit_cost, expiry_date, is_active, existing["item_id"]),
+                            )
+                            updated += 1
+                        else:
+                            c.execute(
+                                """
+                                INSERT INTO items (item_name, unit, qty_available, unit_cost, expiry_date, is_active)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                """,
+                                (name, unit, qty, unit_cost, expiry_date, is_active),
+                            )
+                            created += 1
+                    c.commit()
+                    message = f"Items imported. Created: {created}, Updated: {updated}."
+                finally:
+                    c.close()
+            elif import_type == "requests":
+                created = 0
+                skipped = 0
+                c = conn()
+                try:
+                    for row in reader:
+                        req_id_text = (row.get("request_id") or "").strip()
+                        status = (row.get("status") or "PENDING").strip().upper() or "PENDING"
+                        created_at = (row.get("created_at") or "").strip()
+                        member_name = (row.get("member_name") or row.get("name") or "").strip()
+                        phone = (row.get("phone") or "").strip()
+                        email = (row.get("email") or "").strip()
+                        note = (row.get("note") or "").strip()
+                        reject_reason = (row.get("reject_reason") or "").strip()
+                        items_text = (row.get("items") or "").strip()
+
+                        if not member_name:
+                            skipped += 1
+                            continue
+
+                        if not phone:
+                            phone = "unknown"
+
+                        if req_id_text.isdigit():
+                            existing_req = c.execute(
+                                "SELECT request_id FROM requests WHERE request_id=?",
+                                (int(req_id_text),),
+                            ).fetchone()
+                            if existing_req:
+                                skipped += 1
+                                continue
+
+                        member_row = c.execute(
+                            "SELECT member_id FROM members WHERE email=? OR phone=? ORDER BY created_at DESC LIMIT 1",
+                            (email, phone),
+                        ).fetchone()
+                        if member_row:
+                            member_id = member_row["member_id"]
+                            c.execute(
+                                "UPDATE members SET name=?, phone=?, email=? WHERE member_id=?",
+                                (member_name, phone, email, member_id),
+                            )
+                        else:
+                            c.execute(
+                                "INSERT INTO members (name, phone, email, created_at) VALUES (?, ?, ?, ?)",
+                                (member_name, phone, email, created_at or datetime.utcnow().isoformat()),
+                            )
+                            member_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                        if req_id_text.isdigit():
+                            c.execute(
+                                """
+                                INSERT INTO requests (request_id, member_id, status, note, reject_reason, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    int(req_id_text),
+                                    member_id,
+                                    status,
+                                    note,
+                                    reject_reason,
+                                    created_at or datetime.utcnow().isoformat(),
+                                ),
+                            )
+                            request_id = int(req_id_text)
+                        else:
+                            c.execute(
+                                """
+                                INSERT INTO requests (member_id, status, note, reject_reason, created_at)
+                                VALUES (?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    member_id,
+                                    status,
+                                    note,
+                                    reject_reason,
+                                    created_at or datetime.utcnow().isoformat(),
+                                ),
+                            )
+                            request_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                        if items_text:
+                            for part in items_text.split(";"):
+                                part = part.strip()
+                                if not part:
+                                    continue
+                                qty_val = 0.0
+                                name_unit = part
+                                if " x " in part:
+                                    name_unit, qty_text = part.rsplit(" x ", 1)
+                                    qty_val = parse_float(qty_text) or 0.0
+                                name_unit = name_unit.strip()
+                                unit = ""
+                                name = name_unit
+                                if name_unit.endswith(")") and " (" in name_unit:
+                                    name, unit = name_unit.rsplit(" (", 1)
+                                    unit = unit[:-1]
+                                name = name.strip()
+                                unit = unit.strip()
+                                if not name:
+                                    continue
+                                item_row = c.execute(
+                                    "SELECT item_id FROM items WHERE item_name=?",
+                                    (name,),
+                                ).fetchone()
+                                if not item_row:
+                                    c.execute(
+                                        "INSERT INTO items (item_name, unit, qty_available, is_active) VALUES (?, ?, 0, 1)",
+                                        (name, unit or "unit"),
+                                    )
+                                    item_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+                                else:
+                                    item_id = item_row["item_id"]
+                                if qty_val > 0:
+                                    c.execute(
+                                        "INSERT INTO request_items (request_id, item_id, qty_requested) VALUES (?, ?, ?)",
+                                        (request_id, item_id, qty_val),
+                                    )
+                        created += 1
+                    c.commit()
+                    message = f"Requests imported. Created: {created}, Skipped: {skipped}."
+                finally:
+                    c.close()
+            elif import_type == "managers":
+                created = 0
+                updated = 0
+                c = conn()
+                try:
+                    for row in reader:
+                        username = (row.get("username") or "").strip()
+                        if not username:
+                            continue
+                        email = (row.get("email") or "").strip()
+                        password_hash = (row.get("password_hash") or "").strip()
+                        is_active = 1 if str(row.get("is_active") or "1").strip() != "0" else 0
+                        created_at = (row.get("created_at") or "").strip() or datetime.utcnow().isoformat()
+                        manager_id_text = (row.get("manager_id") or "").strip()
+                        existing = c.execute(
+                            "SELECT manager_id FROM managers WHERE username=?",
+                            (username,),
+                        ).fetchone()
+                        if existing:
+                            if password_hash:
+                                c.execute(
+                                    """
+                                    UPDATE managers
+                                    SET email=?, password_hash=?, is_active=?
+                                    WHERE manager_id=?
+                                    """,
+                                    (email, password_hash, is_active, existing["manager_id"]),
+                                )
+                            else:
+                                c.execute(
+                                    """
+                                    UPDATE managers
+                                    SET email=?, is_active=?
+                                    WHERE manager_id=?
+                                    """,
+                                    (email, is_active, existing["manager_id"]),
+                                )
+                            updated += 1
+                        else:
+                            if manager_id_text.isdigit():
+                                c.execute(
+                                    """
+                                    INSERT INTO managers (manager_id, username, email, password_hash, is_active, created_at)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (
+                                        int(manager_id_text),
+                                        username,
+                                        email,
+                                        password_hash or generate_password_hash("ChangeMe123!"),
+                                        is_active,
+                                        created_at,
+                                    ),
+                                )
+                            else:
+                                c.execute(
+                                    """
+                                    INSERT INTO managers (username, email, password_hash, is_active, created_at)
+                                    VALUES (?, ?, ?, ?, ?)
+                                    """,
+                                    (
+                                        username,
+                                        email,
+                                        password_hash or generate_password_hash("ChangeMe123!"),
+                                        is_active,
+                                        created_at,
+                                    ),
+                                )
+                            created += 1
+                    c.commit()
+                    message = f"Managers imported. Created: {created}, Updated: {updated}."
+                finally:
+                    c.close()
+            elif import_type == "stock_movements":
+                created = 0
+                skipped = 0
+                c = conn()
+                try:
+                    for row in reader:
+                        movement_id_text = (row.get("movement_id") or "").strip()
+                        item_id_text = (row.get("item_id") or "").strip()
+                        movement_type = (row.get("movement_type") or "").strip().upper()
+                        qty_val = parse_float(row.get("qty"))
+                        note = (row.get("note") or "").strip()
+                        created_by = (row.get("created_by") or "").strip() or "manager"
+                        created_at = (row.get("created_at") or "").strip() or datetime.utcnow().isoformat()
+                        if not item_id_text.isdigit() or not movement_type or qty_val is None:
+                            skipped += 1
+                            continue
+                        if movement_id_text.isdigit():
+                            existing = c.execute(
+                                "SELECT movement_id FROM stock_movements WHERE movement_id=?",
+                                (int(movement_id_text),),
+                            ).fetchone()
+                            if existing:
+                                skipped += 1
+                                continue
+                            c.execute(
+                                """
+                                INSERT INTO stock_movements (movement_id, item_id, movement_type, qty, note, created_by, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    int(movement_id_text),
+                                    int(item_id_text),
+                                    movement_type,
+                                    qty_val,
+                                    note,
+                                    created_by,
+                                    created_at,
+                                ),
+                            )
+                        else:
+                            c.execute(
+                                """
+                                INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                """,
+                                (int(item_id_text), movement_type, qty_val, note, created_by, created_at),
+                            )
+                        created += 1
+                    c.commit()
+                    message = f"Stock movements imported. Created: {created}, Skipped: {skipped}."
+                finally:
+                    c.close()
+            elif import_type == "uploads":
+                try:
+                    with zipfile.ZipFile(csv_file.stream) as zf:
+                        safe_extract_zip(zf, os.path.dirname(__file__), ("uploads/", "static/"))
+                    message = "Uploads restored."
+                except zipfile.BadZipFile:
+                    error = "Invalid ZIP file."
+            else:
+                error = "Unknown import type."
+
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Import Data</h3>
+          <p class="muted">Upload CSV exports to restore data after a reset.</p>
+          {% if message %}<p class="ok">{{ message }}</p>{% endif %}
+          {% if error %}<p class="danger">{{ error }}</p>{% endif %}
+          <form method="POST" enctype="multipart/form-data">
+            <label>Import type</label>
+            <select name="import_type" required>
+              <option value="">Select...</option>
+              <option value="items">Items (items.csv)</option>
+              <option value="requests">Requests (requests.csv)</option>
+              <option value="managers">Managers (managers.csv)</option>
+              <option value="stock_movements">Stock Movements (stock_movements.csv)</option>
+              <option value="uploads">Uploads ZIP (uploads.zip)</option>
+            </select>
+            <label>File</label>
+            <input type="file" name="csv_file" accept=".csv,.zip" required />
+            <p style="margin-top:12px;">
+              <button class="btn btn-primary" type="submit">Import CSV</button>
+            </p>
+          </form>
+          <div class="card">
+            <h4>Tips</h4>
+            <p class="muted">Import items first, then requests. Stock movements and managers after. Upload uploads.zip last.</p>
+          </div>
+        </div>
+        """,
+        message=message,
+        error=error,
+    )
+    return render_template_string(BASE, body=body)
 
 
 @APP.route("/manager/review/<int:req_id>")
