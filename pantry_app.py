@@ -3555,7 +3555,7 @@ def manager_items_csv():
     try:
         items = c.execute(
             """
-            SELECT item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active
+            SELECT item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active, image_url
             FROM items
             ORDER BY item_name
             """
@@ -3563,7 +3563,7 @@ def manager_items_csv():
     finally:
         c.close()
 
-    rows = [["item_id", "item_name", "unit", "qty_available", "unit_cost", "expiry_date", "status"]]
+    rows = [["item_id", "item_name", "unit", "qty_available", "unit_cost", "expiry_date", "status", "image_url"]]
     for it in items:
         rows.append(
             [
@@ -3574,6 +3574,7 @@ def manager_items_csv():
                 it["unit_cost"] if it["unit_cost"] is not None else "",
                 it["expiry_date"] or "",
                 "Active" if it["is_active"] == 1 else "Inactive",
+                it["image_url"] or "",
             ]
         )
 
@@ -3736,7 +3737,7 @@ def export_items_rows():
     try:
         items = c.execute(
             """
-            SELECT item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active
+            SELECT item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active, image_url
             FROM items
             ORDER BY item_name
             """
@@ -3744,7 +3745,7 @@ def export_items_rows():
     finally:
         c.close()
 
-    rows = [["item_id", "item_name", "unit", "qty_available", "unit_cost", "expiry_date", "status"]]
+    rows = [["item_id", "item_name", "unit", "qty_available", "unit_cost", "expiry_date", "status", "image_url"]]
     for it in items:
         rows.append(
             [
@@ -3755,6 +3756,7 @@ def export_items_rows():
                 it["unit_cost"] if it["unit_cost"] is not None else "",
                 it["expiry_date"] or "",
                 "Active" if it["is_active"] == 1 else "Inactive",
+                it["image_url"] or "",
             ]
         )
     return rows
@@ -3951,6 +3953,7 @@ def apply_backup_import(
             unit_cost = parse_float(row.get("unit_cost"))
             expiry_date = (row.get("expiry_date") or "").strip() or None
             is_active = parse_bool_status(row.get("status") or "")
+            image_url = (row.get("image_url") or "").strip() or None
             if not name or not unit:
                 continue
             if item_id_text.isdigit():
@@ -3959,21 +3962,31 @@ def apply_backup_import(
                     (int(item_id_text),),
                 ).fetchone()
                 if existing:
-                    c.execute(
-                        """
-                        UPDATE items
-                        SET item_name=?, unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
-                        WHERE item_id=?
-                        """,
-                        (name, unit, qty, unit_cost, expiry_date, is_active, int(item_id_text)),
-                    )
+                    if image_url is not None:
+                        c.execute(
+                            """
+                            UPDATE items
+                            SET item_name=?, unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?, image_url=?
+                            WHERE item_id=?
+                            """,
+                            (name, unit, qty, unit_cost, expiry_date, is_active, image_url, int(item_id_text)),
+                        )
+                    else:
+                        c.execute(
+                            """
+                            UPDATE items
+                            SET item_name=?, unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
+                            WHERE item_id=?
+                            """,
+                            (name, unit, qty, unit_cost, expiry_date, is_active, int(item_id_text)),
+                        )
                 else:
                     c.execute(
                         """
-                        INSERT INTO items (item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO items (item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active, image_url)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (int(item_id_text), name, unit, qty, unit_cost, expiry_date, is_active),
+                        (int(item_id_text), name, unit, qty, unit_cost, expiry_date, is_active, image_url),
                     )
             else:
                 existing = c.execute(
@@ -3981,21 +3994,31 @@ def apply_backup_import(
                     (name,),
                 ).fetchone()
                 if existing:
-                    c.execute(
-                        """
-                        UPDATE items
-                        SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
-                        WHERE item_id=?
-                        """,
-                        (unit, qty, unit_cost, expiry_date, is_active, existing["item_id"]),
-                    )
+                    if image_url is not None:
+                        c.execute(
+                            """
+                            UPDATE items
+                            SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?, image_url=?
+                            WHERE item_id=?
+                            """,
+                            (unit, qty, unit_cost, expiry_date, is_active, image_url, existing["item_id"]),
+                        )
+                    else:
+                        c.execute(
+                            """
+                            UPDATE items
+                            SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
+                            WHERE item_id=?
+                            """,
+                            (unit, qty, unit_cost, expiry_date, is_active, existing["item_id"]),
+                        )
                 else:
                     c.execute(
                         """
-                        INSERT INTO items (item_name, unit, qty_available, unit_cost, expiry_date, is_active)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO items (item_name, unit, qty_available, unit_cost, expiry_date, is_active, image_url)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (name, unit, qty, unit_cost, expiry_date, is_active),
+                        (name, unit, qty, unit_cost, expiry_date, is_active, image_url),
                     )
 
         req_stream = io.TextIOWrapper(io.BytesIO(requests_bytes), encoding="utf-8", errors="replace")
@@ -4431,6 +4454,7 @@ def manager_import():
                         unit_cost = parse_float(row.get("unit_cost"))
                         expiry_date = (row.get("expiry_date") or "").strip() or None
                         is_active = parse_bool_status(row.get("status") or "")
+                        image_url = (row.get("image_url") or "").strip() or None
                         if not name or not unit:
                             continue
                         if item_id_text.isdigit():
@@ -4439,22 +4463,32 @@ def manager_import():
                                 (int(item_id_text),),
                             ).fetchone()
                             if existing:
-                                c.execute(
-                                    """
-                                    UPDATE items
-                                    SET item_name=?, unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
-                                    WHERE item_id=?
-                                    """,
-                                    (name, unit, qty, unit_cost, expiry_date, is_active, int(item_id_text)),
-                                )
+                                if image_url is not None:
+                                    c.execute(
+                                        """
+                                        UPDATE items
+                                        SET item_name=?, unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?, image_url=?
+                                        WHERE item_id=?
+                                        """,
+                                        (name, unit, qty, unit_cost, expiry_date, is_active, image_url, int(item_id_text)),
+                                    )
+                                else:
+                                    c.execute(
+                                        """
+                                        UPDATE items
+                                        SET item_name=?, unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
+                                        WHERE item_id=?
+                                        """,
+                                        (name, unit, qty, unit_cost, expiry_date, is_active, int(item_id_text)),
+                                    )
                                 updated += 1
                             else:
                                 c.execute(
                                     """
-                                    INSERT INTO items (item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    INSERT INTO items (item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active, image_url)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    (int(item_id_text), name, unit, qty, unit_cost, expiry_date, is_active),
+                                    (int(item_id_text), name, unit, qty, unit_cost, expiry_date, is_active, image_url),
                                 )
                                 created += 1
                         else:
@@ -4463,22 +4497,32 @@ def manager_import():
                                 (name,),
                             ).fetchone()
                             if existing:
-                                c.execute(
-                                    """
-                                    UPDATE items
-                                    SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
-                                    WHERE item_id=?
-                                    """,
-                                    (unit, qty, unit_cost, expiry_date, is_active, existing["item_id"]),
-                                )
+                                if image_url is not None:
+                                    c.execute(
+                                        """
+                                        UPDATE items
+                                        SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?, image_url=?
+                                        WHERE item_id=?
+                                        """,
+                                        (unit, qty, unit_cost, expiry_date, is_active, image_url, existing["item_id"]),
+                                    )
+                                else:
+                                    c.execute(
+                                        """
+                                        UPDATE items
+                                        SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
+                                        WHERE item_id=?
+                                        """,
+                                        (unit, qty, unit_cost, expiry_date, is_active, existing["item_id"]),
+                                    )
                                 updated += 1
                             else:
                                 c.execute(
                                     """
-                                    INSERT INTO items (item_name, unit, qty_available, unit_cost, expiry_date, is_active)
-                                    VALUES (?, ?, ?, ?, ?, ?)
+                                    INSERT INTO items (item_name, unit, qty_available, unit_cost, expiry_date, is_active, image_url)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    (name, unit, qty, unit_cost, expiry_date, is_active),
+                                    (name, unit, qty, unit_cost, expiry_date, is_active, image_url),
                                 )
                                 created += 1
                     c.commit()
