@@ -178,6 +178,27 @@ def safe_extract_zip(zf: zipfile.ZipFile, target_dir: str, allow_prefixes: tuple
             dst.write(src.read())
 
 
+def extract_uploads_zip(zf: zipfile.ZipFile) -> None:
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    for member in zf.infolist():
+        if member.is_dir():
+            continue
+        name = member.filename.replace("\\", "/")
+        if name.startswith("/") or ".." in name:
+            continue
+        if name.startswith("uploads/"):
+            rel_name = name[len("uploads/"):]
+            out_path = os.path.join(UPLOAD_FOLDER, rel_name)
+        elif name.startswith("static/"):
+            rel_name = name[len("static/"):]
+            out_path = os.path.join(static_dir, rel_name)
+        else:
+            continue
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with zf.open(member) as src, open(out_path, "wb") as dst:
+            dst.write(src.read())
+
+
 def to_csv_bytes(rows: list[list[str]]) -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
@@ -4223,7 +4244,7 @@ def apply_backup_import(
     if uploads_bytes:
         try:
             with zipfile.ZipFile(io.BytesIO(uploads_bytes)) as zf:
-                safe_extract_zip(zf, os.path.dirname(__file__), ("uploads/", "static/"))
+                extract_uploads_zip(zf)
         except zipfile.BadZipFile:
             pass
 
@@ -4715,7 +4736,7 @@ def manager_import():
             elif import_type == "uploads":
                 try:
                     with zipfile.ZipFile(csv_file.stream) as zf:
-                        safe_extract_zip(zf, os.path.dirname(__file__), ("uploads/", "static/"))
+                        extract_uploads_zip(zf)
                     message = "Uploads restored."
                 except zipfile.BadZipFile:
                     error = "Invalid ZIP file."
