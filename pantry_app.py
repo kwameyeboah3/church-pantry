@@ -696,6 +696,7 @@ BASE = """
           <a href="/manager/reports">Reports</a>
           <a href="/manager/backup">Backup</a>
           <a href="/manager/import">Import</a>
+          <a href="/manager/members">Members</a>
           <a href="/manager/managers">Users</a>
           <a href="/manager/logout">Logout</a>
         {% else %}
@@ -941,6 +942,97 @@ def manager_users():
                             message = "Manager updated."
             finally:
                 c.close()
+        elif action == "edit":
+            manager_id = int(request.form.get("manager_id") or 0)
+            username = (request.form.get("username") or "").strip()
+            email = (request.form.get("email") or "").strip()
+            password = (request.form.get("password") or "").strip()
+            is_active = int(request.form.get("is_active") or 1)
+            if not username:
+                error = "Username is required."
+            else:
+                c = conn()
+                try:
+                    current = get_current_manager()
+                    target = c.execute(
+                        "SELECT manager_id, is_active FROM managers WHERE manager_id=?",
+                        (manager_id,),
+                    ).fetchone()
+                    if not target:
+                        error = "Manager not found."
+                    elif current and current["manager_id"] == manager_id and is_active == 0:
+                        error = "You cannot deactivate your own account."
+                    else:
+                        active_count = c.execute(
+                            "SELECT COUNT(*) AS cnt FROM managers WHERE is_active=1"
+                        ).fetchone()["cnt"]
+                        if target["is_active"] == 1 and is_active == 0 and active_count <= 1:
+                            error = "At least one active manager is required."
+                        else:
+                            existing = c.execute(
+                                "SELECT manager_id FROM managers WHERE username=?",
+                                (username,),
+                            ).fetchone()
+                            if existing and existing["manager_id"] != manager_id:
+                                error = "Username already exists."
+                            else:
+                                if password:
+                                    c.execute(
+                                        """
+                                        UPDATE managers
+                                        SET username=?, email=?, password_hash=?, is_active=?
+                                        WHERE manager_id=?
+                                        """,
+                                        (
+                                            username,
+                                            email,
+                                            generate_password_hash(password),
+                                            is_active,
+                                            manager_id,
+                                        ),
+                                    )
+                                else:
+                                    c.execute(
+                                        """
+                                        UPDATE managers
+                                        SET username=?, email=?, is_active=?
+                                        WHERE manager_id=?
+                                        """,
+                                        (username, email, is_active, manager_id),
+                                    )
+                                c.commit()
+                                message = "Manager updated."
+                finally:
+                    c.close()
+        elif action == "delete":
+            manager_id = int(request.form.get("manager_id") or 0)
+            confirm = request.form.get("confirm") == "yes"
+            if not confirm:
+                error = "Please confirm delete."
+            else:
+                c = conn()
+                try:
+                    current = get_current_manager()
+                    target = c.execute(
+                        "SELECT manager_id, is_active FROM managers WHERE manager_id=?",
+                        (manager_id,),
+                    ).fetchone()
+                    if not target:
+                        error = "Manager not found."
+                    elif current and current["manager_id"] == manager_id:
+                        error = "You cannot delete your own account."
+                    else:
+                        active_count = c.execute(
+                            "SELECT COUNT(*) AS cnt FROM managers WHERE is_active=1"
+                        ).fetchone()["cnt"]
+                        if target["is_active"] == 1 and active_count <= 1:
+                            error = "At least one active manager is required."
+                        else:
+                            c.execute("DELETE FROM managers WHERE manager_id=?", (manager_id,))
+                            c.commit()
+                            message = "Manager deleted."
+                finally:
+                    c.close()
 
     c = conn()
     try:
@@ -983,21 +1075,41 @@ def manager_users():
         <div class="card">
           <h4>Existing Managers</h4>
           <table>
-            <tr><th>Username</th><th>Email</th><th>Status</th><th>Created</th><th>Action</th></tr>
+            <tr><th>Username</th><th>Email</th><th>Status</th><th>Created</th><th>Actions</th></tr>
             {% if managers|length == 0 %}
               <tr><td colspan="5" class="muted">No managers found.</td></tr>
             {% else %}
               {% for m in managers %}
                 <tr>
-                  <td>{{ m["username"] }}</td>
-                  <td>{{ m["email"] or "-" }}</td>
-                  <td>{% if m["is_active"] == 1 %}Active{% else %}Inactive{% endif %}</td>
+                  <td>
+                    <form method="POST">
+                      <input type="hidden" name="action" value="edit" />
+                      <input type="hidden" name="manager_id" value="{{ m['manager_id'] }}" />
+                      <input name="username" value="{{ m['username'] }}" required />
+                  </td>
+                  <td>
+                      <input name="email" value="{{ m['email'] or '' }}" />
+                  </td>
+                  <td>
+                      <select name="is_active">
+                        <option value="1" {% if m["is_active"] == 1 %}selected{% endif %}>Active</option>
+                        <option value="0" {% if m["is_active"] != 1 %}selected{% endif %}>Inactive</option>
+                      </select>
+                      <div class="muted" style="margin-top:6px;">New password (optional)</div>
+                      <input name="password" type="password" />
+                  </td>
                   <td>{{ m["created_at"] }}</td>
                   <td>
-                    <form method="POST" style="margin:0;">
-                      <input type="hidden" name="action" value="toggle" />
+                      <button class="btn" type="submit">Save</button>
+                    </form>
+                    <form method="POST" style="margin-top:8px;">
+                      <input type="hidden" name="action" value="delete" />
                       <input type="hidden" name="manager_id" value="{{ m['manager_id'] }}" />
-                      <button class="btn" type="submit">{% if m["is_active"] == 1 %}Deactivate{% else %}Activate{% endif %}</button>
+                      <label class="muted" style="display:block;">
+                        <input type="checkbox" name="confirm" value="yes" />
+                        Confirm delete
+                      </label>
+                      <button class="btn" type="submit">Delete</button>
                     </form>
                   </td>
                 </tr>
@@ -1447,6 +1559,8 @@ def manager_stock():
                     <input type="hidden" name="item_id" value="{{ it['item_id'] }}" />
                     <input name="item_name" value="{{ it['item_name'] }}" required style="margin-bottom:6px;" />
                     <input name="unit" value="{{ it['unit'] }}" required style="margin-bottom:6px;" />
+                    <div class="muted">Set qty</div>
+                    <input type="number" step="0.01" min="0" name="qty_set" value="{{ it['qty_available'] }}" style="margin-bottom:6px;" />
                     <input type="number" step="0.01" min="0" name="unit_cost" value="{{ it['unit_cost'] or '' }}" placeholder="Unit cost" style="margin-bottom:6px;" />
                     <input type="date" name="expiry_date" value="{{ it['expiry_date'] or '' }}" style="margin-bottom:6px;" />
                     <select name="is_active" style="margin-bottom:6px;">
@@ -1577,14 +1691,27 @@ def manager_edit_item():
     item_id = int(item_id_text)
     item_name = (request.form.get("item_name") or "").strip()
     unit = (request.form.get("unit") or "").strip()
+    qty_set_raw = (request.form.get("qty_set") or "").strip()
+    qty_set = parse_float(qty_set_raw) if qty_set_raw != "" else None
     unit_cost_val = parse_float(request.form.get("unit_cost"))
     expiry_date = (request.form.get("expiry_date") or "").strip() or None
     is_active = int(request.form.get("is_active") or 1)
     if not item_name or not unit:
         return redirect(url_for("manager_stock", err="Item name and unit are required."))
+    if qty_set_raw != "" and qty_set is None:
+        return redirect(url_for("manager_stock", err="Quantity must be a number."))
+    if qty_set is not None and qty_set < 0:
+        return redirect(url_for("manager_stock", err="Quantity cannot be negative."))
 
     c = conn()
     try:
+        current_qty_row = c.execute(
+            "SELECT qty_available FROM items WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        if not current_qty_row:
+            return redirect(url_for("manager_stock", err="Item not found."))
+        current_qty = float(current_qty_row["qty_available"] or 0.0)
         c.execute(
             """
             UPDATE items
@@ -1593,6 +1720,13 @@ def manager_edit_item():
             """,
             (item_name, unit, unit_cost_val, expiry_date, is_active, item_id),
         )
+        if qty_set is not None and qty_set != current_qty:
+            delta = qty_set - current_qty
+            c.execute("UPDATE items SET qty_available=? WHERE item_id=?", (qty_set, item_id))
+            c.execute(
+                "INSERT INTO stock_movements (item_id, movement_type, qty, note, created_by) VALUES (?, ?, ?, 'Manual adjustment', ?)",
+                (item_id, "IN" if delta > 0 else "OUT", abs(delta), current_manager_name()),
+            )
         c.commit()
     except sqlite3.IntegrityError:
         return redirect(url_for("manager_stock", err="Item name must be unique."))
@@ -1823,6 +1957,21 @@ def manager_requests():
                   <button class="btn" name="decision" value="REJECT" type="submit">Reject</button>
                 </form>
               {% endif %}
+              <div class="row" style="margin-top:12px;">
+                <div>
+                  <a class="btn" href="/manager/request_edit/{{ r['request_id'] }}">Edit details</a>
+                </div>
+                <div>
+                  <form method="POST" action="{{ url_for('manager_delete_request') }}">
+                    <input type="hidden" name="request_id" value="{{ r['request_id'] }}" />
+                    <label class="muted" style="display:block;">
+                      <input type="checkbox" name="confirm" value="yes" />
+                      Confirm delete (does not adjust stock)
+                    </label>
+                    <button class="btn" type="submit">Delete</button>
+                  </form>
+                </div>
+              </div>
             </div>
           {% endfor %}
         </div>
@@ -1953,6 +2102,313 @@ def manager_requests_csv():
         c.close()
 
     return csv_response("requests.csv", rows)
+
+
+@APP.post("/manager/delete-request")
+@requires_manager_auth
+def manager_delete_request():
+    req_id_text = (request.form.get("request_id") or "").strip()
+    confirm = request.form.get("confirm") == "yes"
+    if not req_id_text.isdigit():
+        abort(400, "Invalid request_id")
+    if not confirm:
+        return redirect(url_for("manager_requests"))
+    req_id = int(req_id_text)
+    c = conn()
+    try:
+        c.execute("DELETE FROM request_items WHERE request_id=?", (req_id,))
+        c.execute("DELETE FROM requests WHERE request_id=?", (req_id,))
+        c.commit()
+    finally:
+        c.close()
+    return redirect(url_for("manager_requests"))
+
+
+@APP.route("/manager/request_edit/<int:req_id>", methods=["GET", "POST"])
+@requires_manager_auth
+def manager_request_edit(req_id: int):
+    c = conn()
+    try:
+        req = c.execute(
+            """
+            SELECT r.request_id, r.status, r.note, r.reject_reason, r.created_at, r.decided_at, r.decided_by,
+                   m.member_id, m.name, m.phone, m.email
+            FROM requests r
+            JOIN members m ON m.member_id = r.member_id
+            WHERE r.request_id=?
+            """,
+            (req_id,),
+        ).fetchone()
+        if not req:
+            return render_template_string(BASE, body="<h3>Request not found.</h3>"), 404
+
+        items_all = c.execute(
+            """
+            SELECT item_id, item_name, unit, is_active
+            FROM items
+            ORDER BY item_name
+            """
+        ).fetchall()
+
+        items = c.execute(
+            """
+            SELECT i.item_name, i.unit, ri.qty_requested
+            FROM request_items ri
+            JOIN items i ON i.item_id = ri.item_id
+            WHERE ri.request_id=?
+            """,
+            (req_id,),
+        ).fetchall()
+        existing_qty = {row["item_id"]: row["qty_requested"] for row in c.execute(
+            "SELECT item_id, qty_requested FROM request_items WHERE request_id=?",
+            (req_id,),
+        ).fetchall()}
+
+        if request.method == "POST":
+            name = (request.form.get("name") or "").strip()
+            phone = (request.form.get("phone") or "").strip()
+            email = (request.form.get("email") or "").strip()
+            note = (request.form.get("note") or "").strip()
+            reject_reason = (request.form.get("reject_reason") or "").strip()
+            status = (request.form.get("status") or "PENDING").strip().upper()
+            if not name or not phone:
+                return render_template_string(
+                    BASE,
+                    body="<div class='card danger'><b>Name and phone are required.</b></div>",
+                ), 400
+            if status not in ("PENDING", "APPROVED", "REJECTED"):
+                return render_template_string(
+                    BASE,
+                    body="<div class='card danger'><b>Invalid status.</b></div>",
+                ), 400
+            c.execute(
+                "UPDATE members SET name=?, phone=?, email=? WHERE member_id=?",
+                (name, phone, email, req["member_id"]),
+            )
+            decided_at = req["decided_at"]
+            decided_by = req["decided_by"]
+            if status != req["status"]:
+                if status in ("APPROVED", "REJECTED"):
+                    decided_at = datetime.utcnow().isoformat()
+                    decided_by = current_manager_name()
+                else:
+                    decided_at = None
+                    decided_by = None
+            c.execute(
+                """
+                UPDATE requests
+                SET status=?, note=?, reject_reason=?, decided_at=?, decided_by=?
+                WHERE request_id=?
+                """,
+                (status, note, reject_reason, decided_at, decided_by, req_id),
+            )
+            c.execute("DELETE FROM request_items WHERE request_id=?", (req_id,))
+            for it in items_all:
+                qty_val = parse_float(request.form.get(f"qty_{it['item_id']}")) or 0.0
+                if qty_val > 0:
+                    c.execute(
+                        "INSERT INTO request_items (request_id, item_id, qty_requested) VALUES (?, ?, ?)",
+                        (req_id, it["item_id"], qty_val),
+                    )
+            c.commit()
+            return redirect(url_for("manager_requests"))
+    finally:
+        c.close()
+
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Edit Request #{{ req.request_id }}</h3>
+          <p class="muted">Created: {{ req.created_at }}</p>
+          <table>
+            <tr><th>Item</th><th>Qty</th></tr>
+            {% for it in items %}
+              <tr>
+                <td>{{ it["item_name"] }} <span class="muted">({{ it["unit"] }})</span></td>
+                <td>{{ '%.2f'|format(it["qty_requested"]) }}</td>
+              </tr>
+            {% endfor %}
+          </table>
+          <p class="muted" style="margin-top:10px;">Editing status here does not adjust stock automatically.</p>
+          <form method="POST" style="margin-top:12px;">
+            <label>Status</label>
+            <select name="status">
+              <option value="PENDING" {% if req.status == "PENDING" %}selected{% endif %}>Pending</option>
+              <option value="APPROVED" {% if req.status == "APPROVED" %}selected{% endif %}>Approved</option>
+              <option value="REJECTED" {% if req.status == "REJECTED" %}selected{% endif %}>Rejected</option>
+            </select>
+            <label>Name</label>
+            <input name="name" value="{{ req.name }}" required />
+            <label>Phone</label>
+            <input name="phone" value="{{ req.phone }}" required />
+            <label>Email (optional)</label>
+            <input name="email" value="{{ req.email }}" />
+            <label>Notes / recommendations</label>
+            <textarea name="note" rows="3">{{ req.note or "" }}</textarea>
+            <label>Reject reason (optional)</label>
+            <input name="reject_reason" value="{{ req.reject_reason or "" }}" />
+            <h4 style="margin-top:12px;">Requested Items</h4>
+            <table>
+              <tr><th>Item</th><th>Unit</th><th>Qty Requested</th></tr>
+              {% for it in items_all %}
+                <tr>
+                  <td>{{ it["item_name"] }}{% if it["is_active"] != 1 %} <span class="muted">(inactive)</span>{% endif %}</td>
+                  <td>{{ it["unit"] }}</td>
+                  <td>
+                    <input type="number" step="1" min="0" name="qty_{{ it['item_id'] }}" value="{{ existing_qty.get(it['item_id'], 0) }}" />
+                  </td>
+                </tr>
+              {% endfor %}
+            </table>
+            <p style="margin-top:12px;">
+              <button class="btn btn-primary" type="submit">Save Changes</button>
+              <a class="btn" href="/manager/requests">Cancel</a>
+            </p>
+          </form>
+        </div>
+        """,
+        req=req,
+        items=items,
+        items_all=items_all,
+        existing_qty=existing_qty,
+    )
+    return render_template_string(BASE, body=body)
+
+
+@APP.get("/manager/members")
+@requires_manager_auth
+def manager_members():
+    q = (request.args.get("q") or "").strip()
+    message = (request.args.get("msg") or "").strip()
+    error = (request.args.get("err") or "").strip()
+
+    c = conn()
+    try:
+        params = []
+        where_clause = ""
+        if q:
+            where_clause = "WHERE m.name LIKE ? OR m.phone LIKE ? OR m.email LIKE ?"
+            like = f"%{q}%"
+            params.extend([like, like, like])
+
+        members = c.execute(
+            f"""
+            SELECT m.member_id, m.name, m.phone, m.email, m.created_at,
+                   COUNT(r.request_id) AS request_count
+            FROM members m
+            LEFT JOIN requests r ON r.member_id = m.member_id
+            {where_clause}
+            GROUP BY m.member_id
+            ORDER BY m.created_at DESC
+            """,
+            params,
+        ).fetchall()
+    finally:
+        c.close()
+
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Members</h3>
+          {% if message %}<p class="ok">{{ message }}</p>{% endif %}
+          {% if error %}<p class="danger">{{ error }}</p>{% endif %}
+          <form method="GET" style="margin-top:10px;">
+            <div class="row">
+              <div>
+                <label>Search</label>
+                <input name="q" value="{{ q }}" placeholder="Search by name, phone, or email" />
+              </div>
+              <div style="align-self:flex-end;">
+                <button class="btn btn-primary" type="submit">Apply</button>
+              </div>
+            </div>
+          </form>
+          <table>
+            <tr><th>Name</th><th>Phone</th><th>Email</th><th>Requests</th><th>Actions</th></tr>
+            {% if members|length == 0 %}
+              <tr><td colspan="5" class="muted">No members found.</td></tr>
+            {% else %}
+              {% for m in members %}
+              <tr>
+                <td>
+                  <form method="POST" action="{{ url_for('manager_edit_member') }}">
+                    <input type="hidden" name="member_id" value="{{ m['member_id'] }}" />
+                    <input name="name" value="{{ m['name'] }}" required />
+                </td>
+                <td>
+                    <input name="phone" value="{{ m['phone'] }}" required />
+                </td>
+                <td>
+                    <input name="email" value="{{ m['email'] }}" />
+                </td>
+                <td>{{ m["request_count"] }}</td>
+                <td>
+                    <button class="btn" type="submit">Save</button>
+                  </form>
+                  <form method="POST" action="{{ url_for('manager_delete_member') }}" style="margin-top:8px;">
+                    <input type="hidden" name="member_id" value="{{ m['member_id'] }}" />
+                    <label class="muted" style="display:block;">
+                      <input type="checkbox" name="confirm" value="yes" />
+                      Confirm delete (removes their requests)
+                    </label>
+                    <button class="btn" type="submit">Delete</button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+            {% endif %}
+          </table>
+        </div>
+        """,
+        members=members,
+        q=q,
+        message=message,
+        error=error,
+    )
+    return render_template_string(BASE, body=body)
+
+
+@APP.post("/manager/edit-member")
+@requires_manager_auth
+def manager_edit_member():
+    member_id_text = (request.form.get("member_id") or "").strip()
+    name = (request.form.get("name") or "").strip()
+    phone = (request.form.get("phone") or "").strip()
+    email = (request.form.get("email") or "").strip()
+    if not member_id_text.isdigit():
+        abort(400, "Invalid member_id")
+    if not name or not phone:
+        return redirect(url_for("manager_members", err="Name and phone are required."))
+
+    c = conn()
+    try:
+        c.execute(
+            "UPDATE members SET name=?, phone=?, email=? WHERE member_id=?",
+            (name, phone, email, int(member_id_text)),
+        )
+        c.commit()
+    finally:
+        c.close()
+
+    return redirect(url_for("manager_members", msg="Member updated."))
+
+
+@APP.post("/manager/delete-member")
+@requires_manager_auth
+def manager_delete_member():
+    member_id_text = (request.form.get("member_id") or "").strip()
+    confirm = request.form.get("confirm") == "yes"
+    if not member_id_text.isdigit():
+        abort(400, "Invalid member_id")
+    if not confirm:
+        return redirect(url_for("manager_members", err="Please confirm delete."))
+    c = conn()
+    try:
+        c.execute("DELETE FROM members WHERE member_id=?", (int(member_id_text),))
+        c.commit()
+    finally:
+        c.close()
+    return redirect(url_for("manager_members", msg="Member deleted."))
 
 
 @APP.post("/manager/requests/bulk")
