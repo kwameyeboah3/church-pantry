@@ -3,6 +3,9 @@ import io
 import os
 import sqlite3
 import zipfile
+import base64
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from flask import Flask, request, redirect, url_for, render_template_string, Response, abort, session
 from email.message import EmailMessage
@@ -143,6 +146,39 @@ def safe_extract_zip(zf: zipfile.ZipFile, target_dir: str, allow_prefixes: tuple
         with zf.open(member) as src, open(out_path, "wb") as dst:
             dst.write(src.read())
 
+
+def to_csv_bytes(rows: list[list[str]]) -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    for row in rows:
+        writer.writerow(row)
+    return output.getvalue().encode("utf-8")
+
+
+def build_multipart(fields: dict[str, str], files: list[tuple[str, str, bytes, str]]):
+    boundary = f"----pantryboundary{datetime.utcnow().timestamp()}".replace(".", "")
+    body = io.BytesIO()
+
+    def write_part(data: bytes):
+        body.write(data)
+
+    for key, value in fields.items():
+        write_part(f"--{boundary}\r\n".encode("utf-8"))
+        write_part(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        write_part(f"{value}\r\n".encode("utf-8"))
+
+    for name, filename, content, mime in files:
+        write_part(f"--{boundary}\r\n".encode("utf-8"))
+        write_part(
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode("utf-8")
+        )
+        write_part(f"Content-Type: {mime}\r\n\r\n".encode("utf-8"))
+        write_part(content)
+        write_part(b"\r\n")
+
+    write_part(f"--{boundary}--\r\n".encode("utf-8"))
+    return body.getvalue(), f"multipart/form-data; boundary={boundary}"
+
 def notify_manager_new_request(req_id: int, member_name: str, phone: str, email: str):
     manager_emails = get_manager_emails()
     if not manager_emails:
@@ -191,6 +227,9 @@ MANAGER_PASSWORD = os.environ.get("PANTRY_MANAGER_PASSWORD", "ChangeMe123!")
 CHURCH_NAME = os.environ.get("PANTRY_CHURCH_NAME", "The Church of Pentecost - Kansas District")
 CHURCH_TAGLINE = os.environ.get("PANTRY_CHURCH_TAGLINE", "Serving families with dignity and care")
 LOGO_URL = os.environ.get("PANTRY_LOGO_URL", "/static/church_logo.jpeg")
+RENDER_BASE_URL = os.environ.get("PANTRY_RENDER_BASE_URL", "").rstrip("/")
+RENDER_MANAGER_USER = os.environ.get("PANTRY_RENDER_MANAGER_USER", "")
+RENDER_MANAGER_PASSWORD = os.environ.get("PANTRY_RENDER_MANAGER_PASSWORD", "")
 
 _DB_READY = False
 
@@ -2872,12 +2911,275 @@ def manager_backup():
               <a class="btn" href="/manager/uploads.zip">Uploads ZIP</a>
             </div>
           </div>
+          <p style="margin-top:12px;">
+            <a class="btn btn-primary" href="/manager/sync_render">Sync to Render</a>
+          </p>
           <div class="card">
             <h4>Restore Order</h4>
             <p class="muted">Import items, then requests, then stock movements and managers. Upload uploads.zip last.</p>
           </div>
         </div>
         """
+    )
+    return render_template_string(BASE, body=body)
+
+
+def export_items_rows():
+    c = conn()
+    try:
+        items = c.execute(
+            """
+            SELECT item_name, unit, qty_available, unit_cost, expiry_date, is_active
+            FROM items
+            ORDER BY item_name
+            """
+        ).fetchall()
+    finally:
+        c.close()
+
+    rows = [["item_name", "unit", "qty_available", "unit_cost", "expiry_date", "status"]]
+    for it in items:
+        rows.append(
+            [
+                it["item_name"],
+                it["unit"],
+                it["qty_available"],
+                it["unit_cost"] if it["unit_cost"] is not None else "",
+                it["expiry_date"] or "",
+                "Active" if it["is_active"] == 1 else "Inactive",
+            ]
+        )
+    return rows
+
+
+def export_requests_rows():
+    c = conn()
+    try:
+        reqs = c.execute(
+            """
+            SELECT r.request_id, r.status, r.note, r.reject_reason, r.created_at,
+                   m.name, m.phone, m.email
+            FROM requests r
+            JOIN members m ON m.member_id = r.member_id
+            ORDER BY r.request_id
+            """
+        ).fetchall()
+        rows = [
+            [
+                "request_id",
+                "status",
+                "created_at",
+                "member_name",
+                "phone",
+                "email",
+                "note",
+                "reject_reason",
+                "items",
+            ]
+        ]
+        for r in reqs:
+            items = c.execute(
+                """
+                SELECT i.item_name, i.unit, ri.qty_requested
+                FROM request_items ri
+                JOIN items i ON i.item_id = ri.item_id
+                WHERE ri.request_id = ?
+                """,
+                (r["request_id"],),
+            ).fetchall()
+            item_text = "; ".join(
+                [f"{it['item_name']} ({it['unit']}) x {it['qty_requested']}" for it in items]
+            )
+            rows.append(
+                [
+                    r["request_id"],
+                    r["status"],
+                    r["created_at"],
+                    r["name"],
+                    r["phone"],
+                    r["email"],
+                    r["note"] or "",
+                    r["reject_reason"] or "",
+                    item_text,
+                ]
+            )
+    finally:
+        c.close()
+    return rows
+
+
+def export_managers_rows():
+    c = conn()
+    try:
+        rows_db = c.execute(
+            """
+            SELECT manager_id, username, email, password_hash, is_active, created_at
+            FROM managers
+            ORDER BY username
+            """
+        ).fetchall()
+    finally:
+        c.close()
+
+    rows = [["manager_id", "username", "email", "password_hash", "is_active", "created_at"]]
+    for r in rows_db:
+        rows.append(
+            [
+                r["manager_id"],
+                r["username"],
+                r["email"] or "",
+                r["password_hash"],
+                r["is_active"],
+                r["created_at"],
+            ]
+        )
+    return rows
+
+
+def export_stock_movements_rows():
+    c = conn()
+    try:
+        rows_db = c.execute(
+            """
+            SELECT movement_id, item_id, movement_type, qty, note, created_by, created_at
+            FROM stock_movements
+            ORDER BY movement_id
+            """
+        ).fetchall()
+    finally:
+        c.close()
+
+    rows = [["movement_id", "item_id", "movement_type", "qty", "note", "created_by", "created_at"]]
+    for r in rows_db:
+        rows.append(
+            [
+                r["movement_id"],
+                r["item_id"],
+                r["movement_type"],
+                r["qty"],
+                r["note"] or "",
+                r["created_by"],
+                r["created_at"],
+            ]
+        )
+    return rows
+
+
+def build_uploads_zip_bytes():
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if os.path.isdir(UPLOAD_FOLDER):
+            for root, _, files in os.walk(UPLOAD_FOLDER):
+                for fname in files:
+                    full_path = os.path.join(root, fname)
+                    rel_path = os.path.relpath(full_path, UPLOAD_FOLDER)
+                    zf.write(full_path, os.path.join("uploads", rel_path))
+        static_files = ["church_logo.jpeg", "hero_pantry.jpg", "hero_pantry.webp"]
+        static_dir = os.path.join(os.path.dirname(__file__), "static")
+        for fname in static_files:
+            full_path = os.path.join(static_dir, fname)
+            if os.path.exists(full_path):
+                zf.write(full_path, os.path.join("static", fname))
+    mem.seek(0)
+    return mem.read()
+
+
+def post_render_import(import_type: str, filename: str, content: bytes, mime: str):
+    if not (RENDER_BASE_URL and RENDER_MANAGER_USER and RENDER_MANAGER_PASSWORD):
+        raise ValueError("Render sync env vars are missing.")
+    url = f"{RENDER_BASE_URL}/manager/import"
+    fields = {"import_type": import_type}
+    body, content_type = build_multipart(fields, [("csv_file", filename, content, mime)])
+    auth_bytes = f"{RENDER_MANAGER_USER}:{RENDER_MANAGER_PASSWORD}".encode("utf-8")
+    auth_header = base64.b64encode(auth_bytes).decode("ascii")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", content_type)
+    req.add_header("Authorization", f"Basic {auth_header}")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.status, resp.read().decode("utf-8", errors="replace")
+
+
+@APP.route("/manager/sync_render", methods=["GET", "POST"])
+@requires_manager_auth
+def manager_sync_render():
+    message = ""
+    error = ""
+    details = []
+
+    if request.method == "POST":
+        confirm = request.form.get("confirm") == "yes"
+        if not confirm:
+            error = "Please confirm before syncing."
+        elif not (RENDER_BASE_URL and RENDER_MANAGER_USER and RENDER_MANAGER_PASSWORD):
+            error = "Render sync settings are missing. Set PANTRY_RENDER_BASE_URL, PANTRY_RENDER_MANAGER_USER, PANTRY_RENDER_MANAGER_PASSWORD."
+        else:
+            try:
+                items_bytes = to_csv_bytes(export_items_rows())
+                requests_bytes = to_csv_bytes(export_requests_rows())
+                movements_bytes = to_csv_bytes(export_stock_movements_rows())
+                managers_bytes = to_csv_bytes(export_managers_rows())
+                uploads_bytes = build_uploads_zip_bytes()
+
+                steps = [
+                    ("items", "items.csv", items_bytes, "text/csv"),
+                    ("requests", "requests.csv", requests_bytes, "text/csv"),
+                    ("stock_movements", "stock_movements.csv", movements_bytes, "text/csv"),
+                    ("managers", "managers.csv", managers_bytes, "text/csv"),
+                    ("uploads", "uploads.zip", uploads_bytes, "application/zip"),
+                ]
+                for import_type, filename, content, mime in steps:
+                    status, _ = post_render_import(import_type, filename, content, mime)
+                    details.append(f"{import_type}: HTTP {status}")
+                message = "Sync completed."
+            except urllib.error.HTTPError as exc:
+                error = f"Sync failed: HTTP {exc.code}"
+                try:
+                    details.append(exc.read().decode("utf-8", errors="replace"))
+                except Exception:
+                    pass
+            except Exception as exc:
+                error = f"Sync failed: {exc}"
+
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Sync to Render</h3>
+          <p class="muted">This will overwrite Render data with your current local data.</p>
+          {% if message %}<p class="ok">{{ message }}</p>{% endif %}
+          {% if error %}<p class="danger">{{ error }}</p>{% endif %}
+          {% if details %}
+            <div class="card">
+              <h4>Details</h4>
+              <ul>
+                {% for line in details %}
+                  <li>{{ line }}</li>
+                {% endfor %}
+              </ul>
+            </div>
+          {% endif %}
+          <form method="POST">
+            <label>
+              <input type="checkbox" name="confirm" value="yes" />
+              I understand this will overwrite data on Render.
+            </label>
+            <p style="margin-top:12px;">
+              <button class="btn btn-primary" type="submit">Sync Now</button>
+            </p>
+          </form>
+          <div class="card">
+            <h4>Render Settings</h4>
+            <p class="muted">PANTRY_RENDER_BASE_URL: {{ render_base or 'not set' }}</p>
+            <p class="muted">PANTRY_RENDER_MANAGER_USER: {{ render_user or 'not set' }}</p>
+            <p class="muted">PANTRY_RENDER_MANAGER_PASSWORD: {{ 'set' if render_pass else 'not set' }}</p>
+          </div>
+        </div>
+        """,
+        message=message,
+        error=error,
+        details=details,
+        render_base=RENDER_BASE_URL,
+        render_user=RENDER_MANAGER_USER,
+        render_pass=RENDER_MANAGER_PASSWORD,
     )
     return render_template_string(BASE, body=body)
 
