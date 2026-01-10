@@ -2804,7 +2804,7 @@ def manager_items_csv():
     try:
         items = c.execute(
             """
-            SELECT item_name, unit, qty_available, unit_cost, expiry_date, is_active
+            SELECT item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active
             FROM items
             ORDER BY item_name
             """
@@ -2812,10 +2812,11 @@ def manager_items_csv():
     finally:
         c.close()
 
-    rows = [["item_name", "unit", "qty_available", "unit_cost", "expiry_date", "status"]]
+    rows = [["item_id", "item_name", "unit", "qty_available", "unit_cost", "expiry_date", "status"]]
     for it in items:
         rows.append(
             [
+                it["item_id"],
                 it["item_name"],
                 it["unit"],
                 it["qty_available"],
@@ -2959,7 +2960,7 @@ def export_items_rows():
     try:
         items = c.execute(
             """
-            SELECT item_name, unit, qty_available, unit_cost, expiry_date, is_active
+            SELECT item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active
             FROM items
             ORDER BY item_name
             """
@@ -2967,10 +2968,11 @@ def export_items_rows():
     finally:
         c.close()
 
-    rows = [["item_name", "unit", "qty_available", "unit_cost", "expiry_date", "status"]]
+    rows = [["item_id", "item_name", "unit", "qty_available", "unit_cost", "expiry_date", "status"]]
     for it in items:
         rows.append(
             [
+                it["item_id"],
                 it["item_name"],
                 it["unit"],
                 it["qty_available"],
@@ -3191,6 +3193,7 @@ def manager_sync_render():
                     c = conn()
                     try:
                         for row in reader:
+                            item_id_text = (row.get("item_id") or "").strip()
                             name = (row.get("item_name") or "").strip()
                             unit = (row.get("unit") or "").strip()
                             qty = parse_float(row.get("qty_available")) or 0.0
@@ -3199,27 +3202,50 @@ def manager_sync_render():
                             is_active = parse_bool_status(row.get("status") or "")
                             if not name or not unit:
                                 continue
-                            existing = c.execute(
-                                "SELECT item_id FROM items WHERE item_name=?",
-                                (name,),
-                            ).fetchone()
-                            if existing:
-                                c.execute(
-                                    """
-                                    UPDATE items
-                                    SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
-                                    WHERE item_id=?
-                                    """,
-                                    (unit, qty, unit_cost, expiry_date, is_active, existing["item_id"]),
-                                )
+                            if item_id_text.isdigit():
+                                existing = c.execute(
+                                    "SELECT item_id FROM items WHERE item_id=?",
+                                    (int(item_id_text),),
+                                ).fetchone()
+                                if existing:
+                                    c.execute(
+                                        """
+                                        UPDATE items
+                                        SET item_name=?, unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
+                                        WHERE item_id=?
+                                        """,
+                                        (name, unit, qty, unit_cost, expiry_date, is_active, int(item_id_text)),
+                                    )
+                                else:
+                                    c.execute(
+                                        """
+                                        INSERT INTO items (item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                        """,
+                                        (int(item_id_text), name, unit, qty, unit_cost, expiry_date, is_active),
+                                    )
                             else:
-                                c.execute(
-                                    """
-                                    INSERT INTO items (item_name, unit, qty_available, unit_cost, expiry_date, is_active)
-                                    VALUES (?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (name, unit, qty, unit_cost, expiry_date, is_active),
-                                )
+                                existing = c.execute(
+                                    "SELECT item_id FROM items WHERE item_name=?",
+                                    (name,),
+                                ).fetchone()
+                                if existing:
+                                    c.execute(
+                                        """
+                                        UPDATE items
+                                        SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
+                                        WHERE item_id=?
+                                        """,
+                                        (unit, qty, unit_cost, expiry_date, is_active, existing["item_id"]),
+                                    )
+                                else:
+                                    c.execute(
+                                        """
+                                        INSERT INTO items (item_name, unit, qty_available, unit_cost, expiry_date, is_active)
+                                        VALUES (?, ?, ?, ?, ?, ?)
+                                        """,
+                                        (name, unit, qty, unit_cost, expiry_date, is_active),
+                                    )
 
                         req_stream = io.TextIOWrapper(io.BytesIO(requests_bytes), encoding="utf-8", errors="replace")
                         req_reader = csv.DictReader(req_stream)
@@ -3527,6 +3553,7 @@ def manager_import():
                 c = conn()
                 try:
                     for row in reader:
+                        item_id_text = (row.get("item_id") or "").strip()
                         name = (row.get("item_name") or "").strip()
                         unit = (row.get("unit") or "").strip()
                         qty = parse_float(row.get("qty_available")) or 0.0
@@ -3535,29 +3562,54 @@ def manager_import():
                         is_active = parse_bool_status(row.get("status") or "")
                         if not name or not unit:
                             continue
-                        existing = c.execute(
-                            "SELECT item_id FROM items WHERE item_name=?",
-                            (name,),
-                        ).fetchone()
-                        if existing:
-                            c.execute(
-                                """
-                                UPDATE items
-                                SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
-                                WHERE item_id=?
-                                """,
-                                (unit, qty, unit_cost, expiry_date, is_active, existing["item_id"]),
-                            )
-                            updated += 1
+                        if item_id_text.isdigit():
+                            existing = c.execute(
+                                "SELECT item_id FROM items WHERE item_id=?",
+                                (int(item_id_text),),
+                            ).fetchone()
+                            if existing:
+                                c.execute(
+                                    """
+                                    UPDATE items
+                                    SET item_name=?, unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
+                                    WHERE item_id=?
+                                    """,
+                                    (name, unit, qty, unit_cost, expiry_date, is_active, int(item_id_text)),
+                                )
+                                updated += 1
+                            else:
+                                c.execute(
+                                    """
+                                    INSERT INTO items (item_id, item_name, unit, qty_available, unit_cost, expiry_date, is_active)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (int(item_id_text), name, unit, qty, unit_cost, expiry_date, is_active),
+                                )
+                                created += 1
                         else:
-                            c.execute(
-                                """
-                                INSERT INTO items (item_name, unit, qty_available, unit_cost, expiry_date, is_active)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                                """,
-                                (name, unit, qty, unit_cost, expiry_date, is_active),
-                            )
-                            created += 1
+                            existing = c.execute(
+                                "SELECT item_id FROM items WHERE item_name=?",
+                                (name,),
+                            ).fetchone()
+                            if existing:
+                                c.execute(
+                                    """
+                                    UPDATE items
+                                    SET unit=?, qty_available=?, unit_cost=?, expiry_date=?, is_active=?
+                                    WHERE item_id=?
+                                    """,
+                                    (unit, qty, unit_cost, expiry_date, is_active, existing["item_id"]),
+                                )
+                                updated += 1
+                            else:
+                                c.execute(
+                                    """
+                                    INSERT INTO items (item_name, unit, qty_available, unit_cost, expiry_date, is_active)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (name, unit, qty, unit_cost, expiry_date, is_active),
+                                )
+                                created += 1
                     c.commit()
                     message = f"Items imported. Created: {created}, Updated: {updated}."
                 finally:
