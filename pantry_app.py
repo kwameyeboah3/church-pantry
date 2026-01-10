@@ -441,11 +441,12 @@ def current_manager_name() -> str:
 
 
 def is_sync_token_valid() -> bool:
-    if not PANTRY_SYNC_TOKEN:
+    token = PANTRY_SYNC_TOKEN or session.get("sync_token") or ""
+    if not token:
         return False
     header_token = request.headers.get("X-PANTRY-SYNC-TOKEN", "")
     form_token = request.form.get("sync_token") or ""
-    return header_token == PANTRY_SYNC_TOKEN or form_token == PANTRY_SYNC_TOKEN
+    return header_token == token or form_token == token
 
 
 def requires_import_auth(func):
@@ -3104,14 +3105,16 @@ def build_uploads_zip_bytes():
 
 
 def post_render_import(import_type: str, filename: str, content: bytes, mime: str):
-    if not (RENDER_BASE_URL and PANTRY_SYNC_TOKEN):
+    render_base = RENDER_BASE_URL or session.get("render_base") or ""
+    sync_token = PANTRY_SYNC_TOKEN or session.get("sync_token") or ""
+    if not (render_base and sync_token):
         raise ValueError("Render sync settings are missing.")
-    url = f"{RENDER_BASE_URL}/manager/import"
+    url = f"{render_base}/manager/import"
     fields = {"import_type": import_type}
     body, content_type = build_multipart(fields, [("csv_file", filename, content, mime)])
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", content_type)
-    req.add_header("X-PANTRY-SYNC-TOKEN", PANTRY_SYNC_TOKEN)
+    req.add_header("X-PANTRY-SYNC-TOKEN", sync_token)
     with urllib.request.urlopen(req, timeout=60) as resp:
         return resp.status, resp.read().decode("utf-8", errors="replace")
 
@@ -3125,9 +3128,12 @@ def manager_sync_render():
 
     if request.method == "POST":
         confirm = request.form.get("confirm") == "yes"
+        if request.form.get("save_settings") == "yes":
+            session["render_base"] = (request.form.get("render_base") or "").strip().rstrip("/")
+            session["sync_token"] = (request.form.get("sync_token") or "").strip()
         if not confirm:
             error = "Please confirm before syncing."
-        elif not (RENDER_BASE_URL and PANTRY_SYNC_TOKEN):
+        elif not ((RENDER_BASE_URL or session.get("render_base")) and (PANTRY_SYNC_TOKEN or session.get("sync_token"))):
             error = "Render sync settings are missing. Set PANTRY_RENDER_BASE_URL and PANTRY_SYNC_TOKEN."
         else:
             try:
@@ -3175,6 +3181,14 @@ def manager_sync_render():
             </div>
           {% endif %}
           <form method="POST">
+            <label>Render base URL</label>
+            <input name="render_base" value="{{ render_base or '' }}" placeholder="https://church-pantry.onrender.com" />
+            <label>Sync token</label>
+            <input name="sync_token" type="password" value="{{ sync_token or '' }}" />
+            <label>
+              <input type="checkbox" name="save_settings" value="yes" />
+              Save these settings for this session
+            </label>
             <label>
               <input type="checkbox" name="confirm" value="yes" />
               I understand this will overwrite data on Render.
@@ -3193,8 +3207,8 @@ def manager_sync_render():
         message=message,
         error=error,
         details=details,
-        render_base=RENDER_BASE_URL,
-        sync_token=PANTRY_SYNC_TOKEN,
+        render_base=RENDER_BASE_URL or session.get("render_base"),
+        sync_token=PANTRY_SYNC_TOKEN or session.get("sync_token"),
     )
     return render_template_string(BASE, body=body)
 
