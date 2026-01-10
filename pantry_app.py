@@ -230,6 +230,7 @@ LOGO_URL = os.environ.get("PANTRY_LOGO_URL", "/static/church_logo.jpeg")
 RENDER_BASE_URL = os.environ.get("PANTRY_RENDER_BASE_URL", "").rstrip("/")
 RENDER_MANAGER_USER = os.environ.get("PANTRY_RENDER_MANAGER_USER", "")
 RENDER_MANAGER_PASSWORD = os.environ.get("PANTRY_RENDER_MANAGER_PASSWORD", "")
+PANTRY_SYNC_TOKEN = os.environ.get("PANTRY_SYNC_TOKEN", "")
 
 _DB_READY = False
 
@@ -437,6 +438,24 @@ def current_manager_name() -> str:
     if auth and check_manager_credentials(auth.username, auth.password):
         return auth.username
     return "manager"
+
+
+def is_sync_token_valid() -> bool:
+    if not PANTRY_SYNC_TOKEN:
+        return False
+    header_token = request.headers.get("X-PANTRY-SYNC-TOKEN", "")
+    form_token = request.form.get("sync_token") or ""
+    return header_token == PANTRY_SYNC_TOKEN or form_token == PANTRY_SYNC_TOKEN
+
+
+def requires_import_auth(func):
+    def wrapper(*args, **kwargs):
+        if is_manager_logged_in() or is_sync_token_valid():
+            return func(*args, **kwargs)
+        return redirect(url_for("manager_login", next=request.path))
+
+    wrapper.__name__ = func.__name__
+    return wrapper
 
 
 @APP.context_processor
@@ -3085,16 +3104,14 @@ def build_uploads_zip_bytes():
 
 
 def post_render_import(import_type: str, filename: str, content: bytes, mime: str):
-    if not (RENDER_BASE_URL and RENDER_MANAGER_USER and RENDER_MANAGER_PASSWORD):
-        raise ValueError("Render sync env vars are missing.")
+    if not (RENDER_BASE_URL and PANTRY_SYNC_TOKEN):
+        raise ValueError("Render sync settings are missing.")
     url = f"{RENDER_BASE_URL}/manager/import"
     fields = {"import_type": import_type}
     body, content_type = build_multipart(fields, [("csv_file", filename, content, mime)])
-    auth_bytes = f"{RENDER_MANAGER_USER}:{RENDER_MANAGER_PASSWORD}".encode("utf-8")
-    auth_header = base64.b64encode(auth_bytes).decode("ascii")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", content_type)
-    req.add_header("Authorization", f"Basic {auth_header}")
+    req.add_header("X-PANTRY-SYNC-TOKEN", PANTRY_SYNC_TOKEN)
     with urllib.request.urlopen(req, timeout=60) as resp:
         return resp.status, resp.read().decode("utf-8", errors="replace")
 
@@ -3110,8 +3127,8 @@ def manager_sync_render():
         confirm = request.form.get("confirm") == "yes"
         if not confirm:
             error = "Please confirm before syncing."
-        elif not (RENDER_BASE_URL and RENDER_MANAGER_USER and RENDER_MANAGER_PASSWORD):
-            error = "Render sync settings are missing. Set PANTRY_RENDER_BASE_URL, PANTRY_RENDER_MANAGER_USER, PANTRY_RENDER_MANAGER_PASSWORD."
+        elif not (RENDER_BASE_URL and PANTRY_SYNC_TOKEN):
+            error = "Render sync settings are missing. Set PANTRY_RENDER_BASE_URL and PANTRY_SYNC_TOKEN."
         else:
             try:
                 items_bytes = to_csv_bytes(export_items_rows())
@@ -3169,8 +3186,7 @@ def manager_sync_render():
           <div class="card">
             <h4>Render Settings</h4>
             <p class="muted">PANTRY_RENDER_BASE_URL: {{ render_base or 'not set' }}</p>
-            <p class="muted">PANTRY_RENDER_MANAGER_USER: {{ render_user or 'not set' }}</p>
-            <p class="muted">PANTRY_RENDER_MANAGER_PASSWORD: {{ 'set' if render_pass else 'not set' }}</p>
+            <p class="muted">PANTRY_SYNC_TOKEN: {{ 'set' if sync_token else 'not set' }}</p>
           </div>
         </div>
         """,
@@ -3178,14 +3194,13 @@ def manager_sync_render():
         error=error,
         details=details,
         render_base=RENDER_BASE_URL,
-        render_user=RENDER_MANAGER_USER,
-        render_pass=RENDER_MANAGER_PASSWORD,
+        sync_token=PANTRY_SYNC_TOKEN,
     )
     return render_template_string(BASE, body=body)
 
 
 @APP.route("/manager/import", methods=["GET", "POST"])
-@requires_manager_auth
+@requires_import_auth
 def manager_import():
     message = ""
     error = ""
