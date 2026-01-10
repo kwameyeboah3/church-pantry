@@ -61,12 +61,16 @@ def send_email(to_email: str, subject: str, body: str):
     Optional email notifications (works if SMTP env vars are set).
     Safe: if not configured, it prints a warning and continues.
     """
-    host = os.environ.get("SMTP_HOST")
-    port = int(os.environ.get("SMTP_PORT", "587"))
-    user = os.environ.get("SMTP_USER")
-    password = os.environ.get("SMTP_PASSWORD")
-    use_tls = os.environ.get("SMTP_TLS", "1") == "1"
-    from_email = os.environ.get("SMTP_FROM", user or "no-reply@example.com")
+    host = get_setting_value("smtp_host", os.environ.get("SMTP_HOST", ""))
+    port_text = get_setting_value("smtp_port", os.environ.get("SMTP_PORT", "587"))
+    user = get_setting_value("smtp_user", os.environ.get("SMTP_USER", ""))
+    password = get_setting_value("smtp_password", os.environ.get("SMTP_PASSWORD", ""))
+    use_tls = get_setting_value("smtp_tls", os.environ.get("SMTP_TLS", "1")) == "1"
+    from_email = get_setting_value("smtp_from", os.environ.get("SMTP_FROM", "")) or (user or "no-reply@example.com")
+    try:
+        port = int(port_text)
+    except ValueError:
+        port = 587
 
     if not host or not user or not password:
         print("⚠️ Email not sent (SMTP not configured). Set SMTP_HOST/SMTP_USER/SMTP_PASSWORD.")
@@ -95,7 +99,7 @@ def get_manager_emails() -> list[str]:
         c.close()
     emails = [r["email"] for r in rows]
     if not emails:
-        fallback = os.environ.get("MANAGER_EMAIL")
+        fallback = get_setting_value("manager_email", os.environ.get("MANAGER_EMAIL", ""))
         if fallback:
             emails = [fallback]
     return emails
@@ -118,6 +122,33 @@ def parse_bool_status(value: str) -> int:
     if val in ("inactive", "0", "false", "no"):
         return 0
     return 1
+
+
+def get_setting_value(key: str, default: str = "") -> str:
+    try:
+        c = conn()
+        try:
+            row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return default
+    return row["value"] if row and row["value"] is not None else default
+
+
+def set_setting_value(key: str, value: str) -> None:
+    c = conn()
+    try:
+        c.execute(
+            """
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
+        c.commit()
+    finally:
+        c.close()
 
 
 def parse_float(value: str | None) -> float | None:
@@ -184,6 +215,10 @@ def notify_manager_new_request(req_id: int, member_name: str, phone: str, email:
     if not manager_emails:
         print("⚠️ Manager email not set; manager notification skipped.")
         return
+    public_base = get_setting_value(
+        "public_base_url",
+        os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:5000"),
+    )
     subject = f"New Pantry Request #{req_id}"
     body = (
         f"A new pantry request was submitted.\n\n"
@@ -192,7 +227,7 @@ def notify_manager_new_request(req_id: int, member_name: str, phone: str, email:
         f"Phone: {phone}\n"
         f"Email: {email}\n\n"
         f"Open approvals:\n"
-        f"{os.environ.get('PUBLIC_BASE_URL','http://127.0.0.1:5000')}/manager/requests\n"
+        f"{public_base}/manager/requests\n"
     )
     for manager_email in manager_emails:
         send_email(manager_email, subject, body)
@@ -311,6 +346,11 @@ def init_db():
                 qty_requested   REAL NOT NULL,
                 FOREIGN KEY(request_id) REFERENCES requests(request_id) ON DELETE CASCADE,
                 FOREIGN KEY(item_id) REFERENCES items(item_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT
             );
             """
         )
@@ -441,7 +481,7 @@ def current_manager_name() -> str:
 
 
 def is_sync_token_valid() -> bool:
-    token = PANTRY_SYNC_TOKEN or session.get("sync_token") or ""
+    token = PANTRY_SYNC_TOKEN or get_setting_value("sync_token") or session.get("sync_token") or ""
     if not token:
         return False
     header_token = request.headers.get("X-PANTRY-SYNC-TOKEN", "")
@@ -474,9 +514,9 @@ def inject_manager_auth():
     return {
         "is_manager": is_manager_logged_in(),
         "current_manager": get_current_manager(),
-        "church_name": CHURCH_NAME,
-        "church_tagline": CHURCH_TAGLINE,
-        "logo_url": LOGO_URL,
+        "church_name": get_setting_value("church_name", CHURCH_NAME),
+        "church_tagline": get_setting_value("church_tagline", CHURCH_TAGLINE),
+        "logo_url": get_setting_value("logo_url", LOGO_URL),
     }
 
 
@@ -698,6 +738,7 @@ BASE = """
           <a href="/manager/import">Import</a>
           <a href="/manager/members">Members</a>
           <a href="/manager/managers">Users</a>
+          <a href="/manager/settings">Settings</a>
           <a href="/manager/logout">Logout</a>
         {% else %}
           <a href="/manager/login">Login</a>
@@ -2411,6 +2452,142 @@ def manager_delete_member():
     return redirect(url_for("manager_members", msg="Member deleted."))
 
 
+@APP.route("/manager/settings", methods=["GET", "POST"])
+@requires_manager_auth
+def manager_settings():
+    message = ""
+    error = ""
+
+    if request.method == "POST":
+        try:
+            church_name = (request.form.get("church_name") or "").strip()
+            church_tagline = (request.form.get("church_tagline") or "").strip()
+            logo_url = (request.form.get("logo_url") or "").strip()
+            public_base_url = (request.form.get("public_base_url") or "").strip()
+            manager_email = (request.form.get("manager_email") or "").strip()
+
+            smtp_host = (request.form.get("smtp_host") or "").strip()
+            smtp_port = (request.form.get("smtp_port") or "").strip()
+            smtp_user = (request.form.get("smtp_user") or "").strip()
+            smtp_password = (request.form.get("smtp_password") or "").strip()
+            smtp_from = (request.form.get("smtp_from") or "").strip()
+            smtp_tls = "1" if request.form.get("smtp_tls") == "1" else "0"
+
+            render_base_url = (request.form.get("render_base_url") or "").strip().rstrip("/")
+            sync_token = (request.form.get("sync_token") or "").strip()
+
+            logo_file = request.files.get("logo_file")
+            if logo_file and logo_file.filename:
+                try:
+                    logo_url = save_uploaded_image(logo_file)
+                except ValueError as exc:
+                    return render_template_string(
+                        BASE, body=f"<div class='card danger'><b>{exc}</b></div>"
+                    ), 400
+
+            if church_name:
+                set_setting_value("church_name", church_name)
+            if church_tagline:
+                set_setting_value("church_tagline", church_tagline)
+            if logo_url != "":
+                set_setting_value("logo_url", logo_url)
+            if public_base_url != "":
+                set_setting_value("public_base_url", public_base_url)
+            if manager_email != "":
+                set_setting_value("manager_email", manager_email)
+
+            if smtp_host != "":
+                set_setting_value("smtp_host", smtp_host)
+            if smtp_port != "":
+                set_setting_value("smtp_port", smtp_port)
+            if smtp_user != "":
+                set_setting_value("smtp_user", smtp_user)
+            if smtp_password != "":
+                set_setting_value("smtp_password", smtp_password)
+            if smtp_from != "":
+                set_setting_value("smtp_from", smtp_from)
+            set_setting_value("smtp_tls", smtp_tls)
+
+            if render_base_url != "":
+                set_setting_value("render_base_url", render_base_url)
+            if sync_token != "":
+                set_setting_value("sync_token", sync_token)
+
+            message = "Settings saved."
+        except sqlite3.Error as exc:
+            error = f"Settings update failed: {exc}"
+
+    settings = {
+        "church_name": get_setting_value("church_name", CHURCH_NAME),
+        "church_tagline": get_setting_value("church_tagline", CHURCH_TAGLINE),
+        "logo_url": get_setting_value("logo_url", LOGO_URL),
+        "public_base_url": get_setting_value("public_base_url", os.environ.get("PUBLIC_BASE_URL", "")),
+        "manager_email": get_setting_value("manager_email", os.environ.get("MANAGER_EMAIL", "")),
+        "smtp_host": get_setting_value("smtp_host", os.environ.get("SMTP_HOST", "")),
+        "smtp_port": get_setting_value("smtp_port", os.environ.get("SMTP_PORT", "587")),
+        "smtp_user": get_setting_value("smtp_user", os.environ.get("SMTP_USER", "")),
+        "smtp_from": get_setting_value("smtp_from", os.environ.get("SMTP_FROM", "")),
+        "smtp_tls": get_setting_value("smtp_tls", os.environ.get("SMTP_TLS", "1")),
+        "render_base_url": get_setting_value("render_base_url", RENDER_BASE_URL),
+        "sync_token_set": bool(get_setting_value("sync_token", PANTRY_SYNC_TOKEN)),
+    }
+
+    body = render_template_string(
+        """
+        <div class="card">
+          <h3>Settings</h3>
+          {% if message %}<p class="ok">{{ message }}</p>{% endif %}
+          {% if error %}<p class="danger">{{ error }}</p>{% endif %}
+          <form method="POST" enctype="multipart/form-data">
+            <h4>Branding</h4>
+            <label>Church Name</label>
+            <input name="church_name" value="{{ settings.church_name }}" />
+            <label>Tagline</label>
+            <input name="church_tagline" value="{{ settings.church_tagline }}" />
+            <label>Logo URL</label>
+            <input name="logo_url" value="{{ settings.logo_url }}" />
+            <label>Upload Logo (optional)</label>
+            <input name="logo_file" type="file" />
+
+            <h4 style="margin-top:16px;">Email</h4>
+            <label>Public Base URL</label>
+            <input name="public_base_url" value="{{ settings.public_base_url }}" placeholder="https://church-pantry.onrender.com" />
+            <label>Manager Notification Email</label>
+            <input name="manager_email" value="{{ settings.manager_email }}" />
+            <label>SMTP Host</label>
+            <input name="smtp_host" value="{{ settings.smtp_host }}" />
+            <label>SMTP Port</label>
+            <input name="smtp_port" value="{{ settings.smtp_port }}" />
+            <label>SMTP User</label>
+            <input name="smtp_user" value="{{ settings.smtp_user }}" />
+            <label>SMTP Password (leave blank to keep current)</label>
+            <input name="smtp_password" type="password" />
+            <label>SMTP From</label>
+            <input name="smtp_from" value="{{ settings.smtp_from }}" />
+            <label>
+              <input type="checkbox" name="smtp_tls" value="1" {% if settings.smtp_tls == "1" %}checked{% endif %} />
+              Use TLS
+            </label>
+
+            <h4 style="margin-top:16px;">Sync</h4>
+            <label>Render Base URL</label>
+            <input name="render_base_url" value="{{ settings.render_base_url }}" placeholder="https://church-pantry.onrender.com" />
+            <label>Sync Token (leave blank to keep current)</label>
+            <input name="sync_token" type="password" placeholder="{% if settings.sync_token_set %}set{% else %}not set{% endif %}" />
+
+            <p style="margin-top:12px;">
+              <button class="btn btn-primary" type="submit">Save Settings</button>
+            </p>
+          </form>
+        </div>
+        """,
+        message=message,
+        error=error,
+        settings=settings,
+    )
+    return render_template_string(BASE, body=body)
+
+
 @APP.post("/manager/requests/bulk")
 @requires_manager_auth
 def manager_requests_bulk():
@@ -3695,8 +3872,8 @@ def build_uploads_zip_bytes():
 
 
 def post_render_import(import_type: str, filename: str, content: bytes, mime: str):
-    render_base = RENDER_BASE_URL or session.get("render_base") or ""
-    sync_token = PANTRY_SYNC_TOKEN or session.get("sync_token") or ""
+    render_base = RENDER_BASE_URL or get_setting_value("render_base_url") or session.get("render_base") or ""
+    sync_token = PANTRY_SYNC_TOKEN or get_setting_value("sync_token") or session.get("sync_token") or ""
     if not (render_base and sync_token):
         raise ValueError("Render sync settings are missing.")
     url = f"{render_base}/manager/import"
@@ -3710,8 +3887,8 @@ def post_render_import(import_type: str, filename: str, content: bytes, mime: st
 
 
 def fetch_render_file(path: str) -> bytes:
-    render_base = RENDER_BASE_URL or session.get("render_base") or ""
-    sync_token = PANTRY_SYNC_TOKEN or session.get("sync_token") or ""
+    render_base = RENDER_BASE_URL or get_setting_value("render_base_url") or session.get("render_base") or ""
+    sync_token = PANTRY_SYNC_TOKEN or get_setting_value("sync_token") or session.get("sync_token") or ""
     if not (render_base and sync_token):
         raise ValueError("Render sync settings are missing.")
     url = f"{render_base}{path}"
@@ -4067,11 +4244,14 @@ def manager_sync_render():
             session["sync_token"] = (request.form.get("sync_token") or "").strip()
         if not confirm:
             error = "Please confirm before syncing."
-        elif not ((RENDER_BASE_URL or session.get("render_base")) and (PANTRY_SYNC_TOKEN or session.get("sync_token"))):
+        elif not (
+            (RENDER_BASE_URL or get_setting_value("render_base_url") or session.get("render_base"))
+            and (PANTRY_SYNC_TOKEN or get_setting_value("sync_token") or session.get("sync_token"))
+        ):
             error = "Render sync settings are missing. Set PANTRY_RENDER_BASE_URL and PANTRY_SYNC_TOKEN."
         else:
             current_base = request.host_url.rstrip("/")
-            target_base = (RENDER_BASE_URL or session.get("render_base") or "").rstrip("/")
+            target_base = (RENDER_BASE_URL or get_setting_value("render_base_url") or session.get("render_base") or "").rstrip("/")
             if target_base and current_base == target_base:
                 error = "Sync must be run from your local app, not from Render."
             else:
@@ -4172,8 +4352,8 @@ def manager_sync_render():
         message=message,
         error=error,
         details=details,
-        render_base=RENDER_BASE_URL or session.get("render_base"),
-        sync_token=PANTRY_SYNC_TOKEN or session.get("sync_token"),
+        render_base=RENDER_BASE_URL or get_setting_value("render_base_url") or session.get("render_base"),
+        sync_token=PANTRY_SYNC_TOKEN or get_setting_value("sync_token") or session.get("sync_token"),
     )
     return render_template_string(BASE, body=body)
 
