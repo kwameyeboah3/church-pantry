@@ -1289,6 +1289,8 @@ def manager_stock():
     q = (request.args.get("q") or "").strip()
     sort = (request.args.get("sort") or "name").strip()
     direction = (request.args.get("dir") or "asc").strip().lower()
+    message = (request.args.get("msg") or "").strip()
+    error = (request.args.get("err") or "").strip()
     sort_map = {
         "name": "item_name",
         "qty": "qty_available",
@@ -1313,7 +1315,7 @@ def manager_stock():
 
         items_table = c.execute(
             f"""
-            SELECT item_id, item_name, unit, qty_available, expiry_date, is_active
+            SELECT item_id, item_name, unit, qty_available, expiry_date, is_active, unit_cost
             FROM items
             {where_clause}
             ORDER BY {order_col} {order_dir}, item_name
@@ -1327,6 +1329,12 @@ def manager_stock():
         """
         <div class="card">
           <h3>Stock Intake</h3>
+          {% if message %}
+            <p class="ok">{{ message }}</p>
+          {% endif %}
+          {% if error %}
+            <p class="danger">{{ error }}</p>
+          {% endif %}
 
           <div class="row">
             <div class="card" style="flex:1;">
@@ -1420,10 +1428,10 @@ def manager_stock():
           </form>
           <table>
             <tr>
-              <th>Item</th><th>Unit</th><th>Qty</th><th>Expiry</th><th>Status</th>
+              <th>Item</th><th>Unit</th><th>Qty</th><th>Expiry</th><th>Status</th><th>Actions</th>
             </tr>
             {% if items_table|length == 0 %}
-              <tr><td colspan="5" class="muted">No items found.</td></tr>
+              <tr><td colspan="6" class="muted">No items found.</td></tr>
             {% else %}
               {% for it in items_table %}
               <tr>
@@ -1432,6 +1440,28 @@ def manager_stock():
                 <td>{{ '%.2f'|format(it["qty_available"]) }}</td>
                 <td>{% if it["expiry_date"] %}{{ it["expiry_date"] }}{% else %}<span class="muted">—</span>{% endif %}</td>
                 <td>{% if it["is_active"] == 1 %}<span class="ok">Active</span>{% else %}<span class="danger">Inactive</span>{% endif %}</td>
+                <td>
+                  <form method="POST" action="{{ url_for('manager_edit_item') }}" style="margin-bottom:8px;">
+                    <input type="hidden" name="item_id" value="{{ it['item_id'] }}" />
+                    <input name="item_name" value="{{ it['item_name'] }}" required style="margin-bottom:6px;" />
+                    <input name="unit" value="{{ it['unit'] }}" required style="margin-bottom:6px;" />
+                    <input type="number" step="0.01" min="0" name="unit_cost" value="{{ it['unit_cost'] or '' }}" placeholder="Unit cost" style="margin-bottom:6px;" />
+                    <input type="date" name="expiry_date" value="{{ it['expiry_date'] or '' }}" style="margin-bottom:6px;" />
+                    <select name="is_active" style="margin-bottom:6px;">
+                      <option value="1" {% if it["is_active"] == 1 %}selected{% endif %}>Active</option>
+                      <option value="0" {% if it["is_active"] != 1 %}selected{% endif %}>Inactive</option>
+                    </select>
+                    <button class="btn" type="submit">Save</button>
+                  </form>
+                  <form method="POST" action="{{ url_for('manager_delete_item') }}" style="margin:0;">
+                    <input type="hidden" name="item_id" value="{{ it['item_id'] }}" />
+                    <label class="muted" style="display:block;">
+                      <input type="checkbox" name="confirm" value="yes" />
+                      Confirm delete
+                    </label>
+                    <button class="btn" type="submit">Delete</button>
+                  </form>
+                </td>
               </tr>
               {% endfor %}
             {% endif %}
@@ -1443,6 +1473,8 @@ def manager_stock():
         q=q,
         sort=sort,
         direction=direction,
+        message=message,
+        error=error,
     )
     return render_template_string(BASE, body=body)
 
@@ -1522,6 +1554,59 @@ def manager_update_item():
         c.close()
 
     return redirect(url_for("manager_stock"))
+
+
+@APP.post("/manager/edit-item")
+@requires_manager_auth
+def manager_edit_item():
+    item_id_text = (request.form.get("item_id") or "").strip()
+    if not item_id_text.isdigit():
+        abort(400, "Invalid item_id")
+    item_id = int(item_id_text)
+    item_name = (request.form.get("item_name") or "").strip()
+    unit = (request.form.get("unit") or "").strip()
+    unit_cost_val = parse_float(request.form.get("unit_cost"))
+    expiry_date = (request.form.get("expiry_date") or "").strip() or None
+    is_active = int(request.form.get("is_active") or 1)
+    if not item_name or not unit:
+        return redirect(url_for("manager_stock", err="Item name and unit are required."))
+
+    c = conn()
+    try:
+        c.execute(
+            """
+            UPDATE items
+            SET item_name=?, unit=?, unit_cost=?, expiry_date=?, is_active=?
+            WHERE item_id=?
+            """,
+            (item_name, unit, unit_cost_val, expiry_date, is_active, item_id),
+        )
+        c.commit()
+    except sqlite3.IntegrityError:
+        return redirect(url_for("manager_stock", err="Item name must be unique."))
+    finally:
+        c.close()
+
+    return redirect(url_for("manager_stock", msg="Item updated."))
+
+
+@APP.post("/manager/delete-item")
+@requires_manager_auth
+def manager_delete_item():
+    item_id_text = (request.form.get("item_id") or "").strip()
+    confirm = request.form.get("confirm") == "yes"
+    if not item_id_text.isdigit():
+        abort(400, "Invalid item_id")
+    if not confirm:
+        return redirect(url_for("manager_stock", err="Please confirm delete."))
+    item_id = int(item_id_text)
+    c = conn()
+    try:
+        c.execute("DELETE FROM items WHERE item_id=?", (item_id,))
+        c.commit()
+    finally:
+        c.close()
+    return redirect(url_for("manager_stock", msg="Item deleted."))
 
 
 @APP.get("/manager/requests")
