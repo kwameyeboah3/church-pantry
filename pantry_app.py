@@ -936,8 +936,8 @@ def member_request():
                 <input name="phone" required />
               </div>
               <div>
-                <label>Email *</label>
-                <input name="email" type="email" required />
+                <label>Email (optional)</label>
+                <input name="email" type="email" />
               </div>
             </div>
 
@@ -971,7 +971,7 @@ def member_request():
               </table>
             {% endif %}
 
-            <label>Notes (optional)</label>
+            <label>Recommendations for items you would like us to have (optional)</label>
             <textarea name="note" rows="3"></textarea>
 
             <p style="margin-top:12px;">
@@ -992,8 +992,8 @@ def member_request_preview():
     email = (request.form.get("email") or "").strip()
     note = (request.form.get("note") or "").strip()
 
-    if not name or not phone or not email:
-        abort(400, "Name, phone, and email are required.")
+    if not name or not phone:
+        abort(400, "Name and phone are required.")
 
     c = conn()
     try:
@@ -1033,9 +1033,9 @@ def member_request_preview():
           <p class="muted">Please confirm the items and quantities before submitting.</p>
           <div class="row">
             <div>
-              <p><b>Name:</b> {{ name }}</p>
-              <p><b>Phone:</b> {{ phone }}</p>
-              <p><b>Email:</b> {{ email }}</p>
+          <p><b>Name:</b> {{ name }}</p>
+          <p><b>Phone:</b> {{ phone }}</p>
+          {% if email %}<p><b>Email:</b> {{ email }}</p>{% endif %}
               {% if note %}<p><b>Notes:</b> {{ note }}</p>{% endif %}
             </div>
           </div>
@@ -1085,8 +1085,8 @@ def member_request_submit():
     email = (request.form.get("email") or "").strip()
     note = (request.form.get("note") or "").strip()
 
-    if not name or not phone or not email:
-        abort(400, "Name, phone, and email are required.")
+    if not name or not phone:
+        abort(400, "Name and phone are required.")
 
     c = conn()
     try:
@@ -1141,7 +1141,8 @@ def member_request_submit():
 
     try:
         notify_manager_new_request(request_id, name, phone, email)
-        acknowledge_requester(request_id, email, name)
+        if email:
+            acknowledge_requester(request_id, email, name)
     except Exception as exc:
         print(f"⚠️ Email notification failed: {exc}")
 
@@ -1789,10 +1790,11 @@ def manager_requests_bulk():
                     (reject_reason, datetime.utcnow().isoformat(), current_manager_name(), req_id),
                 )
                 results["rejected"].append(req_id)
-                try:
-                    notify_request_rejected(req_id, r["email"], r["name"], reject_reason)
-                except Exception as exc:
-                    print(f"⚠️ Reject email failed: {exc}")
+                if r["email"]:
+                    try:
+                        notify_request_rejected(req_id, r["email"], r["name"], reject_reason)
+                    except Exception as exc:
+                        print(f"⚠️ Reject email failed: {exc}")
                 continue
 
             # APPROVE
@@ -2426,12 +2428,12 @@ def manager_decide_request():
         if r["status"] != "PENDING":
             return redirect(url_for("manager_requests"))
 
-        if decision == "REJECT":
-            c.execute(
-                "UPDATE requests SET status='REJECTED', reject_reason=?, decided_at=?, decided_by=? WHERE request_id=?",
-                (reject_reason, datetime.utcnow().isoformat(), current_manager_name(), req_id),
-            )
-            c.commit()
+            if decision == "REJECT":
+                c.execute(
+                    "UPDATE requests SET status='REJECTED', reject_reason=?, decided_at=?, decided_by=? WHERE request_id=?",
+                    (reject_reason, datetime.utcnow().isoformat(), current_manager_name(), req_id),
+                )
+                c.commit()
             try:
                 member = c.execute(
                     """
@@ -2442,7 +2444,7 @@ def manager_decide_request():
                     """,
                     (req_id,),
                 ).fetchone()
-                if member:
+                if member and member["email"]:
                     notify_request_rejected(req_id, member["email"], member["name"], reject_reason)
             except Exception as exc:
                 print(f"⚠️ Reject email failed: {exc}")
