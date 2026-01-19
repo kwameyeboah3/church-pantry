@@ -258,7 +258,7 @@ def acknowledge_requester(req_id: int, requester_email: str, member_name: str):
     body = (
         f"Hello {member_name},\n\n"
         f"We received your pantry request (Request #{req_id}).\n"
-        f"Our pantry manager will review and approve/reject it.\n\n"
+        f"Our pantry team will review your request and follow up with you soon.\n\n"
         f"Thank you.\n"
     )
     send_email(requester_email, subject, body)
