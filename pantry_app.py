@@ -2215,7 +2215,7 @@ def manager_request_edit(req_id: int):
 
         items = c.execute(
             """
-            SELECT i.item_name, i.unit, ri.qty_requested
+            SELECT i.item_name, i.unit, ri.qty_requested, i.qty_available
             FROM request_items ri
             JOIN items i ON i.item_id = ri.item_id
             WHERE ri.request_id=?
@@ -2284,11 +2284,12 @@ def manager_request_edit(req_id: int):
           <h3>Edit Request #{{ req.request_id }}</h3>
           <p class="muted">Created: {{ req.created_at }}</p>
           <table>
-            <tr><th>Item</th><th>Qty</th></tr>
+            <tr><th>Item</th><th>Qty</th><th>Available</th></tr>
             {% for it in items %}
               <tr>
                 <td>{{ it["item_name"] }} <span class="muted">({{ it["unit"] }})</span></td>
                 <td>{{ '%.2f'|format(it["qty_requested"]) }}</td>
+                <td>{{ '%.2f'|format(it["qty_available"]) }}</td>
               </tr>
             {% endfor %}
           </table>
