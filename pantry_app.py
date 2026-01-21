@@ -1872,7 +1872,7 @@ def manager_requests():
         for r in reqs:
             rows = c.execute(
                 """
-                SELECT i.item_name, i.unit, ri.qty_requested
+                SELECT i.item_name, i.unit, ri.qty_requested, i.qty_available
                 FROM request_items ri
                 JOIN items i ON i.item_id = ri.item_id
                 WHERE ri.request_id = ?
@@ -2002,11 +2002,12 @@ def manager_requests():
               {% endif %}
 
               <table>
-                <tr><th>Item</th><th>Qty</th></tr>
+                <tr><th>Item</th><th>Qty</th><th>Available</th></tr>
                 {% for it in items_by_req[r["request_id"]] %}
                   <tr>
                     <td>{{ it["item_name"] }} <span class="muted">({{ it["unit"] }})</span></td>
                     <td>{{ '%.2f'|format(it["qty_requested"]) }}</td>
+                    <td>{{ '%.2f'|format(it["qty_available"]) }}</td>
                   </tr>
                 {% endfor %}
               </table>
