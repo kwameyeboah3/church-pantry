@@ -2207,7 +2207,7 @@ def manager_request_edit(req_id: int):
 
         items_all = c.execute(
             """
-            SELECT item_id, item_name, unit, is_active
+            SELECT item_id, item_name, unit, is_active, qty_available
             FROM items
             ORDER BY item_name
             """
@@ -2313,7 +2313,7 @@ def manager_request_edit(req_id: int):
             <input name="reject_reason" value="{{ req.reject_reason or "" }}" />
             <h4 style="margin-top:12px;">Requested Items</h4>
             <table>
-              <tr><th>Item</th><th>Unit</th><th>Qty Requested</th></tr>
+              <tr><th>Item</th><th>Unit</th><th>Qty Requested</th><th>Available</th></tr>
               {% for it in items_all %}
                 <tr>
                   <td>{{ it["item_name"] }}{% if it["is_active"] != 1 %} <span class="muted">(inactive)</span>{% endif %}</td>
@@ -2321,6 +2321,7 @@ def manager_request_edit(req_id: int):
                   <td>
                     <input type="number" step="1" min="0" name="qty_{{ it['item_id'] }}" value="{{ existing_qty.get(it['item_id'], 0) }}" />
                   </td>
+                  <td>{{ '%.2f'|format(it["qty_available"]) }}</td>
                 </tr>
               {% endfor %}
             </table>
