@@ -2216,26 +2216,14 @@ def manager_request_edit(req_id: int):
         ).fetchall()
 
         if request.method == "POST":
-            name = (request.form.get("name") or "").strip()
-            phone = (request.form.get("phone") or "").strip()
-            email = (request.form.get("email") or "").strip()
             note = (request.form.get("note") or "").strip()
             reject_reason = (request.form.get("reject_reason") or "").strip()
             status = (request.form.get("status") or "PENDING").strip().upper()
-            if not name or not phone:
-                return render_template_string(
-                    BASE,
-                    body="<div class='card danger'><b>Name and phone are required.</b></div>",
-                ), 400
             if status not in ("PENDING", "APPROVED", "REJECTED"):
                 return render_template_string(
                     BASE,
                     body="<div class='card danger'><b>Invalid status.</b></div>",
                 ), 400
-            c.execute(
-                "UPDATE members SET name=?, phone=?, email=? WHERE member_id=?",
-                (name, phone, email, req["member_id"]),
-            )
             decided_at = req["decided_at"]
             decided_by = req["decided_by"]
             if status != req["status"]:
@@ -2289,12 +2277,6 @@ def manager_request_edit(req_id: int):
               <option value="APPROVED" {% if req.status == "APPROVED" %}selected{% endif %}>Approved</option>
               <option value="REJECTED" {% if req.status == "REJECTED" %}selected{% endif %}>Rejected</option>
             </select>
-            <label>Name</label>
-            <input name="name" value="{{ req.name }}" required />
-            <label>Phone</label>
-            <input name="phone" value="{{ req.phone }}" required />
-            <label>Email (optional)</label>
-            <input name="email" value="{{ req.email }}" />
             <label>Notes / recommendations</label>
             <textarea name="note" rows="3">{{ req.note or "" }}</textarea>
             <label>Reject reason (optional)</label>
