@@ -2205,27 +2205,15 @@ def manager_request_edit(req_id: int):
         if not req:
             return render_template_string(BASE, body="<h3>Request not found.</h3>"), 404
 
-        items_all = c.execute(
-            """
-            SELECT item_id, item_name, unit, is_active, qty_available
-            FROM items
-            ORDER BY item_name
-            """
-        ).fetchall()
-
         items = c.execute(
             """
-            SELECT i.item_name, i.unit, ri.qty_requested, i.qty_available
+            SELECT i.item_id, i.item_name, i.unit, ri.qty_requested, i.qty_available, i.is_active
             FROM request_items ri
             JOIN items i ON i.item_id = ri.item_id
             WHERE ri.request_id=?
             """,
             (req_id,),
         ).fetchall()
-        existing_qty = {row["item_id"]: row["qty_requested"] for row in c.execute(
-            "SELECT item_id, qty_requested FROM request_items WHERE request_id=?",
-            (req_id,),
-        ).fetchall()}
 
         if request.method == "POST":
             name = (request.form.get("name") or "").strip()
@@ -2266,7 +2254,7 @@ def manager_request_edit(req_id: int):
                 (status, note, reject_reason, decided_at, decided_by, req_id),
             )
             c.execute("DELETE FROM request_items WHERE request_id=?", (req_id,))
-            for it in items_all:
+            for it in items:
                 qty_val = parse_float(request.form.get(f"qty_{it['item_id']}")) or 0.0
                 if qty_val > 0:
                     c.execute(
@@ -2314,12 +2302,12 @@ def manager_request_edit(req_id: int):
             <h4 style="margin-top:12px;">Requested Items</h4>
             <table>
               <tr><th>Item</th><th>Unit</th><th>Qty Requested</th><th>Available</th></tr>
-              {% for it in items_all %}
+              {% for it in items %}
                 <tr>
                   <td>{{ it["item_name"] }}{% if it["is_active"] != 1 %} <span class="muted">(inactive)</span>{% endif %}</td>
                   <td>{{ it["unit"] }}</td>
                   <td>
-                    <input type="number" step="1" min="0" name="qty_{{ it['item_id'] }}" value="{{ existing_qty.get(it['item_id'], 0) }}" />
+                    <input type="number" step="1" min="0" name="qty_{{ it['item_id'] }}" value="{{ it['qty_requested'] }}" />
                   </td>
                   <td>{{ '%.2f'|format(it["qty_available"]) }}</td>
                 </tr>
@@ -2334,8 +2322,6 @@ def manager_request_edit(req_id: int):
         """,
         req=req,
         items=items,
-        items_all=items_all,
-        existing_qty=existing_qty,
     )
     return render_template_string(BASE, body=body)
 
